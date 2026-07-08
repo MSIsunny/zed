@@ -7,10 +7,12 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AlphaMode, AtlasTextureId, Background, Bounds, ContentMask, DevicePixels,
+    ExternalCompositorPrimitive, ExternalCompositorRegistry, ExternalSlotHandle, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, Surface, Underline, point, size,
 };
+use gpui_wgpu::{ExternalComposeOutput, WgpuCompositorBackendCtx, WgpuExternalCompositor, wgpu};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
@@ -27,7 +29,15 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    ffi::c_void,
+    mem, ptr,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -125,6 +135,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    external_compositors_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -133,10 +144,27 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    wgpu_external_context: Option<MacWgpuExternalContext>,
+    wgpu_external_context_generation: u64,
+    frame_index: u64,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+struct MacWgpuExternalContext {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+}
+
+#[derive(Clone)]
+enum MacComposeOutcome {
+    Ready {
+        view: Arc<wgpu::TextureView>,
+        alpha_premultiplied: bool,
+    },
+    Skipped,
 }
 
 #[repr(C)]
@@ -322,6 +350,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let external_compositors_pipeline_state = build_path_sprite_pipeline_state(
+            &device,
+            &library,
+            "external_compositors",
+            "external_compositor_vertex",
+            "external_compositor_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -344,6 +380,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            external_compositors_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -351,6 +388,9 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            wgpu_external_context: None,
+            wgpu_external_context_generation: 1,
+            frame_index: 0,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
         }
@@ -443,7 +483,11 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(
+        &mut self,
+        scene: &Scene,
+        external_compositors: Option<Rc<RefCell<ExternalCompositorRegistry>>>,
+    ) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -453,6 +497,9 @@ impl MetalRenderer {
                 return;
             }
         };
+        self.frame_index = self.frame_index.wrapping_add(1);
+        let external_outcomes =
+            self.compose_external_compositors(scene, external_compositors.as_ref());
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
@@ -474,8 +521,13 @@ impl MetalRenderer {
                 .lock()
                 .acquire(&self.device, self.is_unified_memory);
 
-            let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
+            let command_buffer = self.draw_primitives(
+                scene,
+                &external_outcomes,
+                &mut instance_buffer,
+                drawable,
+                viewport_size,
+            );
 
             match command_buffer {
                 Ok(command_buffer) => {
@@ -496,6 +548,13 @@ impl MetalRenderer {
                     } else {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
+                    }
+                    if let Some(registry) = external_compositors.as_ref() {
+                        let mut registry = registry.borrow_mut();
+                        for handle in external_outcomes.keys() {
+                            registry.mark_processed(*handle);
+                        }
+                        registry.drain_pending_removals();
                     }
                     return;
                 }
@@ -653,8 +712,13 @@ impl MetalRenderer {
                 .lock()
                 .acquire(&self.device, self.is_unified_memory);
 
-            let command_buffer =
-                self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size);
+            let command_buffer = self.draw_primitives_to_texture(
+                scene,
+                &HashMap::default(),
+                &mut instance_buffer,
+                &target_texture,
+                size,
+            );
 
             match command_buffer {
                 Ok(command_buffer) => {
@@ -818,16 +882,24 @@ impl MetalRenderer {
     fn draw_primitives(
         &mut self,
         scene: &Scene,
+        external_outcomes: &HashMap<ExternalSlotHandle, MacComposeOutcome>,
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        self.draw_primitives_to_texture(scene, instance_buffer, drawable.texture(), viewport_size)
+        self.draw_primitives_to_texture(
+            scene,
+            external_outcomes,
+            instance_buffer,
+            drawable.texture(),
+            viewport_size,
+        )
     }
 
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
+        external_outcomes: &HashMap<ExternalSlotHandle, MacComposeOutcome>,
         instance_buffer: &mut InstanceBuffer,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -929,14 +1001,14 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
-                PrimitiveBatch::ExternalCompositors(_) => {
-                    // External composition is not implemented on Metal in this
-                    // phase (gpui_wgpu/Linux only); the element's background quad
-                    // (painted before this primitive when set via
-                    // `ExternalCompositorElement::background`) is left showing
-                    // instead.
-                    true
-                }
+                PrimitiveBatch::ExternalCompositors(range) => self.draw_external_compositor_batch(
+                    &scene.external_compositors[range],
+                    external_outcomes,
+                    instance_buffer,
+                    &mut instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
             };
             if !ok {
                 command_encoder.end_encoding();
@@ -1573,6 +1645,288 @@ impl MetalRenderer {
         }
         true
     }
+
+    fn compose_external_compositors(
+        &mut self,
+        scene: &Scene,
+        registry: Option<&Rc<RefCell<ExternalCompositorRegistry>>>,
+    ) -> HashMap<ExternalSlotHandle, MacComposeOutcome> {
+        let Some(registry) = registry else {
+            return HashMap::default();
+        };
+        if scene.external_compositors.is_empty() {
+            return HashMap::default();
+        }
+
+        let mut outcomes = HashMap::with_capacity(scene.external_compositors.len());
+        for primitive in &scene.external_compositors {
+            let handle = primitive.handle;
+            if outcomes.contains_key(&handle) {
+                continue;
+            }
+            let outcome = self.compose_one_external_compositor(handle, registry);
+            outcomes.insert(handle, outcome);
+        }
+        outcomes
+    }
+
+    fn compose_one_external_compositor(
+        &mut self,
+        handle: ExternalSlotHandle,
+        registry: &Rc<RefCell<ExternalCompositorRegistry>>,
+    ) -> MacComposeOutcome {
+        let context_generation = self.wgpu_external_context_generation;
+        let Some(descriptor_generation) = registry
+            .borrow()
+            .descriptor(handle)
+            .map(|descriptor| descriptor.context_generation)
+        else {
+            return MacComposeOutcome::Skipped;
+        };
+        if descriptor_generation != context_generation {
+            return MacComposeOutcome::Skipped;
+        }
+
+        if self.wgpu_external_context.is_none() {
+            match MacWgpuExternalContext::new() {
+                Ok(context) => {
+                    self.wgpu_external_context = Some(context);
+                }
+                Err(error) => {
+                    log::error!("failed to initialize macOS external wgpu context: {error}");
+                    return MacComposeOutcome::Skipped;
+                }
+            }
+        }
+        let Some(context) = self.wgpu_external_context.as_ref() else {
+            return MacComposeOutcome::Skipped;
+        };
+
+        let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
+            return MacComposeOutcome::Skipped;
+        };
+        let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() else {
+            log::warn!(
+                "external compositor slot {handle:?} holds a compositor that is not a \
+                 `Box<dyn WgpuExternalCompositor>`"
+            );
+            registry.borrow_mut().put_back_compositor(handle, boxed);
+            return MacComposeOutcome::Skipped;
+        };
+
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("macos_external_compositor_encoder"),
+            });
+        let mut ctx = WgpuCompositorBackendCtx {
+            device: Arc::clone(&context.device),
+            queue: Arc::clone(&context.queue),
+            encoder: &mut encoder,
+            context_generation,
+            frame_index: self.frame_index,
+            target_format: wgpu::TextureFormat::Bgra8Unorm,
+        };
+        let result = compositor.compose(handle, &mut ctx);
+        registry.borrow_mut().put_back_compositor(handle, boxed);
+
+        let submission_index = context.queue.submit(std::iter::once(encoder.finish()));
+        if let Err(error) = context.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: Some(Duration::from_secs(1)),
+        }) {
+            log::warn!("waiting for macOS external wgpu composition failed: {error}");
+        }
+
+        match result {
+            ExternalComposeOutput::Ready { view } => {
+                let alpha_premultiplied = registry
+                    .borrow()
+                    .descriptor(handle)
+                    .map(|descriptor| descriptor.alpha_mode == AlphaMode::PreMultiplied)
+                    .unwrap_or(true);
+                MacComposeOutcome::Ready {
+                    view,
+                    alpha_premultiplied,
+                }
+            }
+            ExternalComposeOutput::NotReady => MacComposeOutcome::Skipped,
+            ExternalComposeOutput::ContextLost => {
+                self.invalidate_external_wgpu_context(registry);
+                MacComposeOutcome::Skipped
+            }
+        }
+    }
+
+    fn invalidate_external_wgpu_context(
+        &mut self,
+        registry: &Rc<RefCell<ExternalCompositorRegistry>>,
+    ) {
+        self.wgpu_external_context = None;
+        self.wgpu_external_context_generation =
+            self.wgpu_external_context_generation.saturating_add(1);
+        let new_generation = self.wgpu_external_context_generation;
+        let handles = {
+            let mut registry = registry.borrow_mut();
+            registry.on_context_recreated(new_generation);
+            registry.occupied_handles().collect::<Vec<_>>()
+        };
+        for handle in handles {
+            let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
+                continue;
+            };
+            if let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() {
+                compositor.on_context_recreated(new_generation);
+            }
+            registry.borrow_mut().put_back_compositor(handle, boxed);
+        }
+    }
+
+    fn draw_external_compositor_batch(
+        &self,
+        externals: &[ExternalCompositorPrimitive],
+        outcomes: &HashMap<ExternalSlotHandle, MacComposeOutcome>,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        for primitive in externals {
+            let Some(MacComposeOutcome::Ready {
+                view,
+                alpha_premultiplied,
+            }) = outcomes.get(&primitive.handle)
+            else {
+                continue;
+            };
+            if !self.draw_external_compositor(
+                primitive,
+                view,
+                *alpha_premultiplied,
+                instance_buffer,
+                instance_offset,
+                viewport_size,
+                command_encoder,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn draw_external_compositor(
+        &self,
+        primitive: &ExternalCompositorPrimitive,
+        view: &wgpu::TextureView,
+        alpha_premultiplied: bool,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        align_offset(instance_offset);
+        let next_offset = *instance_offset + mem::size_of::<ExternalCompositorBounds>();
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        let Some(metal_texture_guard) =
+            (unsafe { view.texture().as_hal::<wgpu::hal::api::Metal>() })
+        else {
+            log::warn!("external compositor returned a non-Metal wgpu texture on macOS");
+            return true;
+        };
+        let metal_texture = unsafe {
+            let raw_handle = metal_texture_guard.raw_handle();
+            let texture_ptr = raw_handle as *const _ as *mut metal::MTLTexture;
+            metal::TextureRef::from_ptr(texture_ptr)
+        };
+
+        command_encoder.set_render_pipeline_state(&self.external_compositors_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            ExternalCompositorInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            ExternalCompositorInputIndex::Instances as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            ExternalCompositorInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            ExternalCompositorInputIndex::Texture as u64,
+            Some(metal_texture),
+        );
+
+        unsafe {
+            let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
+                .add(*instance_offset)
+                as *mut ExternalCompositorBounds;
+            ptr::write(
+                buffer_contents,
+                ExternalCompositorBounds {
+                    bounds: primitive.bounds,
+                    content_mask: primitive.content_mask,
+                    alpha_premultiplied: alpha_premultiplied as u32,
+                    _pad: [0; 3],
+                },
+            );
+        }
+
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        *instance_offset = next_offset;
+        true
+    }
+}
+
+impl MacWgpuExternalContext {
+    fn new() -> Result<Self> {
+        futures::executor::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::METAL,
+                flags: wgpu::InstanceFlags::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: None,
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to request adapter: {error}"))?;
+            let adapter_info = adapter.get_info();
+            log::info!(
+                "macOS external compositor selected wgpu adapter: {} ({:?})",
+                adapter_info.name,
+                adapter_info.backend
+            );
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("gpui_macos_external_compositor_device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_defaults()
+                        .using_resolution(adapter.limits())
+                        .using_alignment(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
+            Ok(Self {
+                device: Arc::new(device),
+                queue: Arc::new(queue),
+            })
+        })
+    }
 }
 
 fn new_command_encoder_for_texture<'a>(
@@ -1755,6 +2109,14 @@ enum SurfaceInputIndex {
 }
 
 #[repr(C)]
+enum ExternalCompositorInputIndex {
+    Vertices = 0,
+    Instances = 1,
+    ViewportSize = 2,
+    Texture = 3,
+}
+
+#[repr(C)]
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
@@ -1771,6 +2133,15 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct ExternalCompositorBounds {
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub alpha_premultiplied: u32,
+    pub _pad: [u32; 3],
 }
 
 #[cfg(any(test, feature = "test-support"))]

@@ -24,13 +24,13 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalPaths,
-    FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
-    px, size,
+    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalCompositorRegistry,
+    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
+    WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -59,7 +59,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, c_void},
     mem,
     ops::Range,
@@ -492,6 +492,7 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
+    external_compositors: Rc<RefCell<ExternalCompositorRegistry>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -884,6 +885,7 @@ impl MacWindow {
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
                 ),
+                external_compositors: Rc::new(RefCell::new(ExternalCompositorRegistry::new())),
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1727,7 +1729,12 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        let external_compositors = Rc::clone(&this.external_compositors);
+        this.renderer.draw(scene, Some(external_compositors));
+    }
+
+    fn external_compositor_registry(&self) -> Option<Rc<RefCell<ExternalCompositorRegistry>>> {
+        Some(Rc::clone(&self.0.lock().external_compositors))
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

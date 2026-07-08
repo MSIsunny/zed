@@ -1,8 +1,8 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 //! Demonstrates the `gpui_wgpu` external compositor path: a backend-specific
-//! renderer (here, a trivial procedural-texture generator standing in for e.g. a
-//! wgpu-based 3D renderer) that GPUI composites into a rectangular region of its own
-//! scene, at a controlled point in its own frame (see
+//! renderer (here, a tiny WGSL render pass standing in for e.g. a wgpu-based 3D
+//! renderer) that GPUI composites into a rectangular region of its own scene, at a
+//! controlled point in its own frame (see
 //! `crates/gpui/src/external_compositor.rs` and
 //! `crates/gpui_wgpu/src/wgpu_renderer.rs`).
 //!
@@ -11,8 +11,7 @@
 //! always returns `None` there; this example just shows a "no registry" status label
 //! in that case instead of erroring out (the color set via
 //! `ExternalCompositorElement::background` covers app-visible degradation on
-//! backends without support, e.g. macOS/Metal in this phase — see that element's
-//! docs).
+//! backends without support — see that element's docs).
 //!
 //! Run with `cargo run -p gpui --example external_compositor`. Set
 //! `EXTERNAL_COMPOSITOR_EXIT_AFTER=<n>` (a frame count) to have the example close
@@ -32,7 +31,27 @@ use gpui_wgpu::{
 };
 use std::sync::Arc;
 
-const TEXTURE_SIZE: u32 = 256;
+const DISPLAY_SIZE: f32 = 256.0;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct DemoTextureSize {
+    width: u32,
+    height: u32,
+}
+
+impl DemoTextureSize {
+    fn for_window(window: &Window) -> Self {
+        let scale_factor = window.scale_factor();
+        Self {
+            width: logical_pixels_to_device_texels(DISPLAY_SIZE, scale_factor),
+            height: logical_pixels_to_device_texels(DISPLAY_SIZE, scale_factor),
+        }
+    }
+}
+
+fn logical_pixels_to_device_texels(logical_pixels: f32, scale_factor: f32) -> u32 {
+    (logical_pixels * scale_factor).ceil().max(1.0) as u32
+}
 
 /// Reads `EXTERNAL_COMPOSITOR_EXIT_AFTER` once at startup.
 fn exit_after_frames() -> Option<u64> {
@@ -42,38 +61,194 @@ fn exit_after_frames() -> Option<u64> {
 }
 
 /// A minimal [`WgpuExternalCompositor`]: on its first `compose` call it creates a
-/// `TEXTURE_SIZE`x`TEXTURE_SIZE` `Rgba8UnormSrgb` texture on the frame's `wgpu`
-/// device; every `compose` call after that (including the first) it rewrites the
-/// texture with a procedural gradient plus a diagonal stripe animated by
-/// `ctx.frame_index`, proving the texture is actually updated live, frame over
-/// frame, rather than composited once and left static.
+/// `Rgba8UnormSrgb` render target sized in device texels plus a tiny WGSL pipeline.
+/// Each `compose` call renders a fresh animated frame into that texture, proving
+/// GPUI is sampling a live externally-rendered wgpu texture rather than a CPU-filled
+/// image.
 #[cfg(not(target_family = "wasm"))]
 struct DemoCompositor {
-    texture: Option<(wgpu::Texture, Arc<wgpu::TextureView>)>,
+    texture_size: DemoTextureSize,
+    resources: Option<DemoResources>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct DemoResources {
+    _texture: wgpu::Texture,
+    view: Arc<wgpu::TextureView>,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl DemoCompositor {
-    fn new() -> Self {
-        Self { texture: None }
+    fn new(texture_size: DemoTextureSize) -> Self {
+        Self {
+            texture_size,
+            resources: None,
+        }
     }
 
-    /// A `TEXTURE_SIZE`x`TEXTURE_SIZE` RGBA8 gradient (red = x, green = y) with a
-    /// diagonal stripe that sweeps across the texture as `frame_index` advances.
-    fn pixels(frame_index: u64) -> Vec<u8> {
-        let stripe = (frame_index % TEXTURE_SIZE as u64) as u32;
-        let mut data = vec![0u8; (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize];
-        for y in 0..TEXTURE_SIZE {
-            for x in 0..TEXTURE_SIZE {
-                let i = ((y * TEXTURE_SIZE + x) * 4) as usize;
-                let on_stripe = (x + y) % TEXTURE_SIZE == stripe;
-                data[i] = (x * 255 / (TEXTURE_SIZE - 1)) as u8;
-                data[i + 1] = (y * 255 / (TEXTURE_SIZE - 1)) as u8;
-                data[i + 2] = if on_stripe { 255 } else { 96 };
-                data[i + 3] = 255;
-            }
+    fn create_resources(&self, ctx: &mut WgpuCompositorBackendCtx<'_>) -> DemoResources {
+        let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("external_compositor_example_demo_texture"),
+            size: wgpu::Extent3d {
+                width: self.texture_size.width,
+                height: self.texture_size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let uniform_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("external_compositor_example_uniform_buffer"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("external_compositor_example_bind_group_layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("external_compositor_example_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("external_compositor_example_shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
+struct Params {
+    frame: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> params: Params;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(3.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    let position = positions[vertex_index];
+    var output: VertexOutput;
+    output.position = vec4<f32>(position, 0.0, 1.0);
+    output.uv = position * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let pixel = vec2<u32>(floor(input.position.xy));
+    let cell_size = select(
+        select(4u, 8u, input.uv.x >= 0.5),
+        select(1u, 2u, input.uv.x >= 0.5),
+        input.uv.y < 0.5,
+    );
+    let checker = ((pixel.x / cell_size + pixel.y / cell_size) & 1u) == 0u;
+    var color = select(vec3<f32>(0.02, 0.02, 0.02), vec3<f32>(0.94, 0.94, 0.94), checker);
+
+    if (input.uv.x >= 0.5 && input.uv.y >= 0.5) {
+        color = vec3<f32>(input.uv.x, input.uv.y, 0.22);
+        if ((pixel.x % 8u) == 0u || (pixel.y % 8u) == 0u) {
+            color = vec3<f32>(0.0, 0.0, 0.0);
         }
-        data
+    }
+
+    if ((pixel.x % 64u) == 0u || (pixel.y % 64u) == 0u) {
+        color = vec3<f32>(0.0, 0.45, 1.0);
+    }
+
+    let moving_offset = i32(u32(params.frame) % 128u) - 64;
+    let diagonal_distance = abs(i32(pixel.x) - i32(pixel.y) - moving_offset);
+    if (diagonal_distance == 0) {
+        color = vec3<f32>(1.0, 0.95, 0.0);
+    }
+
+    if (pixel.x == 0u || pixel.y == 0u) {
+        color = vec3<f32>(1.0, 0.0, 0.0);
+    }
+
+    return vec4<f32>(color, 1.0);
+}
+"#
+                    .into(),
+                ),
+            });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("external_compositor_example_pipeline_layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("external_compositor_example_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        DemoResources {
+            _texture: texture,
+            view,
+            pipeline,
+            bind_group,
+            uniform_buffer,
+        }
     }
 }
 
@@ -84,53 +259,51 @@ impl WgpuExternalCompositor for DemoCompositor {
         _slot: ExternalSlotHandle,
         ctx: &mut WgpuCompositorBackendCtx<'_>,
     ) -> ExternalComposeOutput {
-        let (texture, view) = self.texture.get_or_insert_with(|| {
+        if self.resources.is_none() {
             log::info!(
-                "external_compositor example: creating {TEXTURE_SIZE}x{TEXTURE_SIZE} demo \
-                 texture (swapchain target format {:?}, context generation {})",
+                "external_compositor example: creating {}x{} demo wgpu \
+                 render target (swapchain target format {:?}, context generation {})",
+                self.texture_size.width,
+                self.texture_size.height,
                 ctx.target_format,
                 ctx.context_generation,
             );
-            let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("external_compositor_example_demo_texture"),
-                size: wgpu::Extent3d {
-                    width: TEXTURE_SIZE,
-                    height: TEXTURE_SIZE,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+            self.resources = Some(self.create_resources(ctx));
+        }
+        let Some(resources) = self.resources.as_ref() else {
+            return ExternalComposeOutput::NotReady;
+        };
+
+        let params = [ctx.frame_index as f32, 0.0, 0.0, 0.0];
+        let params_bytes = unsafe {
+            std::slice::from_raw_parts(params.as_ptr() as *const u8, std::mem::size_of_val(&params))
+        };
+        ctx.queue
+            .write_buffer(&resources.uniform_buffer, 0, params_bytes);
+
+        {
+            let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("external_compositor_example_render_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &resources.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
             });
-            let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
-            (texture, view)
-        });
+            pass.set_pipeline(&resources.pipeline);
+            pass.set_bind_group(0, &resources.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
 
-        let pixels = Self::pixels(ctx.frame_index);
-        ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(TEXTURE_SIZE * 4),
-                rows_per_image: Some(TEXTURE_SIZE),
-            },
-            wgpu::Extent3d {
-                width: TEXTURE_SIZE,
-                height: TEXTURE_SIZE,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        ExternalComposeOutput::Ready { view: view.clone() }
+        ExternalComposeOutput::Ready {
+            view: resources.view.clone(),
+        }
     }
 
     fn on_context_recreated(&mut self, new_generation: u64) {
@@ -143,12 +316,13 @@ impl WgpuExternalCompositor for DemoCompositor {
             "external_compositor example: graphics context recreated (generation \
              {new_generation}); dropping demo texture"
         );
-        self.texture = None;
+        self.resources = None;
     }
 }
 
 struct ExternalCompositorDemo {
     handle: Option<ExternalSlotHandle>,
+    texture_size: Option<DemoTextureSize>,
     frames_rendered: u64,
     exit_after: Option<u64>,
     status: SharedString,
@@ -158,6 +332,7 @@ impl ExternalCompositorDemo {
     fn new() -> Self {
         Self {
             handle: None,
+            texture_size: None,
             frames_rendered: 0,
             exit_after: exit_after_frames(),
             status: "waiting for external compositor registry".into(),
@@ -171,8 +346,11 @@ impl ExternalCompositorDemo {
             return;
         };
 
+        let texture_size = DemoTextureSize::for_window(window);
         let needs_register = match self.handle {
-            Some(handle) => !registry.borrow().is_valid(handle),
+            Some(handle) => {
+                !registry.borrow().is_valid(handle) || self.texture_size != Some(texture_size)
+            }
             None => true,
         };
         if !needs_register {
@@ -180,6 +358,7 @@ impl ExternalCompositorDemo {
         }
 
         if let Some(old_handle) = self.handle.take() {
+            self.texture_size = None;
             // The previous handle went stale (a graphics context recreation
             // happened): this is `unregister`'s context-recreation cleanup case —
             // it frees the slot immediately, no frame-in-flight deferral, since a
@@ -200,21 +379,32 @@ impl ExternalCompositorDemo {
         }
         log::info!(
             "external_compositor example: registering demo compositor under context \
-             generation {generation}"
+             generation {generation} with {}x{} device texels at {:.2}x scale",
+            texture_size.width,
+            texture_size.height,
+            window.scale_factor(),
         );
 
         let descriptor = ExternalSlotDescriptor {
             format: ExternalSlotFormat::Rgba8UnormSrgb,
             alpha_mode: AlphaMode::Straight,
-            width: TEXTURE_SIZE,
-            height: TEXTURE_SIZE,
+            width: texture_size.width,
+            height: texture_size.height,
             sample_count: 1,
             context_generation: generation,
         };
-        match register_external_compositor(&registry, descriptor, DemoCompositor::new()) {
+        match register_external_compositor(&registry, descriptor, DemoCompositor::new(texture_size))
+        {
             Ok(handle) => {
                 self.handle = Some(handle);
-                self.status = "compositor registered".into();
+                self.texture_size = Some(texture_size);
+                self.status = format!(
+                    "compositor registered — {}x{} texels @ {:.2}x",
+                    texture_size.width,
+                    texture_size.height,
+                    window.scale_factor(),
+                )
+                .into();
             }
             Err(error) => {
                 self.status = format!("registration failed: {error}").into();
@@ -253,16 +443,23 @@ impl Render for ExternalCompositorDemo {
 
         let content = if let Some(handle) = self.handle {
             div()
-                .w(px(TEXTURE_SIZE as f32))
-                .h(px(TEXTURE_SIZE as f32))
-                .border_2()
+                .w(px(DISPLAY_SIZE))
+                .h(px(DISPLAY_SIZE))
+                .rounded(px(20.0))
+                .overflow_hidden()
+                .border_1()
                 .border_color(gpui::white())
-                .child(external_compositor(handle).background(rgba(0x1a1a1aff)))
+                .child(
+                    external_compositor(handle)
+                        .size_full()
+                        .background(rgba(0x1a1a1aff)),
+                )
         } else {
             div()
-                .w(px(TEXTURE_SIZE as f32))
-                .h(px(TEXTURE_SIZE as f32))
-                .border_2()
+                .w(px(DISPLAY_SIZE))
+                .h(px(DISPLAY_SIZE))
+                .rounded(px(20.0))
+                .border_1()
                 .border_color(gpui::white())
                 .bg(gpui::black())
         };

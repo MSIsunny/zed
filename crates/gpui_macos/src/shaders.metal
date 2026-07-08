@@ -899,6 +899,51 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+struct ExternalCompositorVertexOutput {
+  float4 position [[position]];
+  float2 texture_position;
+  uint alpha_premultiplied [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct ExternalCompositorFragmentInput {
+  float4 position [[position]];
+  float2 texture_position;
+  uint alpha_premultiplied [[flat]];
+};
+
+vertex ExternalCompositorVertexOutput external_compositor_vertex(
+    uint unit_vertex_id [[vertex_id]], uint instance_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(ExternalCompositorInputIndex_Vertices)]],
+    constant ExternalCompositorBounds *instances
+    [[buffer(ExternalCompositorInputIndex_Instances)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(ExternalCompositorInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  ExternalCompositorBounds instance = instances[instance_id];
+  float4 device_position =
+      to_device_position(unit_vertex, instance.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(
+      unit_vertex, instance.bounds, instance.content_mask.bounds);
+  return ExternalCompositorVertexOutput{
+      device_position,
+      unit_vertex,
+      instance.alpha_premultiplied,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 external_compositor_fragment(
+    ExternalCompositorFragmentInput input [[stage_in]],
+    texture2d<float> external_texture
+    [[texture(ExternalCompositorInputIndex_Texture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float4 color = external_texture.sample(texture_sampler, input.texture_position);
+  if (input.alpha_premultiplied == 0) {
+    color.rgb *= color.a;
+  }
+  return color;
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
