@@ -606,8 +606,13 @@ impl MetalRenderer {
                 .lock()
                 .acquire(&self.device, self.is_unified_memory);
 
-            let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
+            let command_buffer = self.draw_primitives(
+                scene,
+                &HashMap::default(),
+                &mut instance_buffer,
+                drawable,
+                viewport_size,
+            );
 
             match command_buffer {
                 Ok(command_buffer) => {
@@ -839,8 +844,13 @@ impl MetalRenderer {
                 .lock()
                 .acquire(&self.device, self.is_unified_memory);
 
-            let command_buffer =
-                self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size);
+            let command_buffer = self.draw_primitives_to_texture(
+                scene,
+                &HashMap::default(),
+                &mut instance_buffer,
+                &target_texture,
+                size,
+            );
 
             match command_buffer {
                 Ok(command_buffer) => {
