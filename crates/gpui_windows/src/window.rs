@@ -63,6 +63,7 @@ pub struct WindowsWindowState {
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<DirectXRenderer>,
+    pub external_compositors: Rc<RefCell<ExternalCompositorRegistry>>,
     /// Set after a GPU device-lost recovery so the next `draw_window` call is
     /// treated as a forced render. This guarantees the next frame both
     /// re-enables drawing (via `mark_drawable`) and bypasses the GPUI view
@@ -136,6 +137,7 @@ impl WindowsWindowState {
         let restore_from_minimized = None;
         let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
             .context("Creating DirectX renderer")?;
+        let external_compositors = Rc::new(RefCell::new(ExternalCompositorRegistry::new()));
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -168,6 +170,7 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
+            external_compositors,
             force_render_after_recovery: Cell::new(false),
             click_state,
             current_cursor: Cell::new(current_cursor),
@@ -948,11 +951,20 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let external_compositors = Rc::clone(&self.state.external_compositors);
         self.state
             .renderer
             .borrow_mut()
-            .draw(scene, self.state.background_appearance.get())
+            .draw(
+                scene,
+                self.state.background_appearance.get(),
+                Some(external_compositors),
+            )
             .log_err();
+    }
+
+    fn external_compositor_registry(&self) -> Option<Rc<RefCell<ExternalCompositorRegistry>>> {
+        Some(Rc::clone(&self.state.external_compositors))
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

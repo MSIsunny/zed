@@ -1051,6 +1051,55 @@ float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
 
 /*
 **
+**              External compositors
+**
+*/
+
+struct ExternalCompositorSprite {
+    Bounds bounds;
+    Bounds content_mask;
+    uint alpha_premultiplied;
+    uint3 pad;
+};
+
+struct ExternalCompositorVertexOutput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD1;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct ExternalCompositorFragmentInput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD1;
+};
+
+StructuredBuffer<ExternalCompositorSprite> external_compositors: register(t1);
+
+ExternalCompositorVertexOutput external_compositor_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    ExternalCompositorSprite sprite = external_compositors[sprite_id];
+
+    ExternalCompositorVertexOutput output;
+    output.sprite_id = sprite_id;
+    output.position = to_device_position(unit_vertex, sprite.bounds);
+    output.texture_coords = unit_vertex;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    return output;
+}
+
+float4 external_compositor_fragment(ExternalCompositorFragmentInput input): SV_Target {
+    ExternalCompositorSprite sprite = external_compositors[input.sprite_id];
+    float4 color = t_sprite.Sample(s_sprite, input.texture_coords);
+    if (sprite.alpha_premultiplied == 0u) {
+        color.rgb *= color.a;
+    }
+    return color;
+}
+
+/*
+**
 **              Underlines
 **
 */

@@ -1,25 +1,24 @@
 use anyhow::{Context, Result};
-use gpui_util::ResultExt;
+use gpui_wgpu::{Dx12ExternalWgpuContext, ExternalWgpuContext};
 use itertools::Itertools;
-use windows::Win32::{
-    Foundation::HMODULE,
-    Graphics::{
-        Direct3D::{
-            D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-        },
-        Direct3D11::{
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
-            D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS, D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS,
-            D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-        },
-        Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
-        },
+use std::ffi::c_void;
+use windows::Win32::Graphics::{
+    Direct3D::{
+        D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    },
+    Direct3D11::{
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
+        D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS, D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS,
+        ID3D11Device, ID3D11DeviceContext,
+    },
+    Direct3D11on12::{D3D11On12CreateDevice, ID3D11On12Device},
+    Direct3D12::{ID3D12CommandQueue, ID3D12Device},
+    Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+        IDXGIFactory6,
     },
 };
-use windows::core::Interface;
+use windows::core::{IUnknown, Interface};
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     (0..5)
@@ -41,6 +40,10 @@ pub(crate) struct DirectXDevices {
     pub(crate) dxgi_factory: IDXGIFactory6,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
+    pub(crate) d3d11on12_device: ID3D11On12Device,
+    pub(crate) d3d12_device: ID3D12Device,
+    pub(crate) d3d12_queue: ID3D12CommandQueue,
+    pub(crate) external_wgpu_context: ExternalWgpuContext,
 }
 
 impl DirectXDevices {
@@ -48,17 +51,32 @@ impl DirectXDevices {
         let debug_layer_available = check_debug_layer_available();
         let dxgi_factory =
             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
-        let (adapter, device, device_context, feature_level) =
-            get_adapter(&dxgi_factory, debug_layer_available).context("Getting DXGI adapter")?;
+        let dx12_context =
+            Dx12ExternalWgpuContext::new().context("Creating DX12 external wgpu context")?;
+        let d3d12_device: ID3D12Device = clone_com_interface(
+            dx12_context.d3d12_device_raw,
+            "Borrowing external wgpu D3D12 device",
+        )?;
+        let d3d12_queue: ID3D12CommandQueue = clone_com_interface(
+            dx12_context.d3d12_queue_raw,
+            "Borrowing external wgpu D3D12 command queue",
+        )?;
+        let adapter = get_adapter_by_luid(&dxgi_factory, &d3d12_device)
+            .context("Getting DXGI adapter for external wgpu DX12 device")?;
+        log_adapter_info(&adapter);
+        let (device, device_context, d3d11on12_device, feature_level) =
+            create_d3d11on12_device(&d3d12_device, &d3d12_queue, debug_layer_available)
+                .context("Creating D3D11On12 device")?;
+
         match feature_level {
             D3D_FEATURE_LEVEL_11_1 => {
-                log::info!("Created device with Direct3D 11.1 feature level.")
+                log::info!("Created D3D11On12 device with Direct3D 11.1 feature level.")
             }
             D3D_FEATURE_LEVEL_11_0 => {
-                log::info!("Created device with Direct3D 11.0 feature level.")
+                log::info!("Created D3D11On12 device with Direct3D 11.0 feature level.")
             }
             D3D_FEATURE_LEVEL_10_1 => {
-                log::info!("Created device with Direct3D 10.1 feature level.")
+                log::info!("Created D3D11On12 device with Direct3D 10.1 feature level.")
             }
             _ => unreachable!(),
         }
@@ -68,6 +86,10 @@ impl DirectXDevices {
             dxgi_factory,
             device,
             device_context,
+            d3d11on12_device,
+            d3d12_device,
+            d3d12_queue,
+            external_wgpu_context: dx12_context.context,
         })
     }
 }
@@ -103,74 +125,90 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
 }
 
 #[inline]
-fn get_adapter(
+fn get_adapter_by_luid(
     dxgi_factory: &IDXGIFactory6,
-    debug_layer_available: bool,
-) -> Result<(
-    IDXGIAdapter1,
-    ID3D11Device,
-    ID3D11DeviceContext,
-    D3D_FEATURE_LEVEL,
-)> {
-    for adapter_index in 0.. {
-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
-            let gpu_name = String::from_utf16_lossy(&desc.Description)
-                .trim_matches(char::from(0))
-                .to_string();
-            log::info!("Using GPU: {}", gpu_name);
-        }
-        // Check to see whether the adapter supports Direct3D 11 and create
-        // the device if it does.
-        let mut context: Option<ID3D11DeviceContext> = None;
-        let mut feature_level = D3D_FEATURE_LEVEL::default();
-        if let Some(device) = get_device(
-            &adapter,
-            Some(&mut context),
-            Some(&mut feature_level),
-            debug_layer_available,
-        )
-        .log_err()
-        {
-            return Ok((adapter, device, context.unwrap(), feature_level));
-        }
+    d3d12_device: &ID3D12Device,
+) -> Result<IDXGIAdapter1> {
+    let luid = unsafe { d3d12_device.GetAdapterLuid() };
+    unsafe {
+        dxgi_factory
+            .EnumAdapterByLuid::<IDXGIAdapter1>(luid)
+            .context("Enumerating adapter by DX12 device LUID")
     }
-
-    unreachable!()
 }
 
 #[inline]
-fn get_device(
-    adapter: &IDXGIAdapter1,
-    context: Option<*mut Option<ID3D11DeviceContext>>,
-    feature_level: Option<*mut D3D_FEATURE_LEVEL>,
+fn log_adapter_info(adapter: &IDXGIAdapter1) {
+    if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+        let gpu_name = String::from_utf16_lossy(&desc.Description)
+            .trim_matches(char::from(0))
+            .to_string();
+        log::info!("Using GPU: {}", gpu_name);
+    }
+}
+
+#[inline]
+fn create_d3d11on12_device(
+    d3d12_device: &ID3D12Device,
+    d3d12_queue: &ID3D12CommandQueue,
     debug_layer_available: bool,
-) -> Result<ID3D11Device> {
+) -> Result<(
+    ID3D11Device,
+    ID3D11DeviceContext,
+    ID3D11On12Device,
+    D3D_FEATURE_LEVEL,
+)> {
     let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    let mut feature_level = D3D_FEATURE_LEVEL::default();
     let device_flags = if debug_layer_available {
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG
     } else {
         D3D11_CREATE_DEVICE_BGRA_SUPPORT
     };
+    let command_queue: IUnknown = d3d12_queue
+        .cast()
+        .context("Casting DX12 command queue for D3D11On12CreateDevice")?;
+
     unsafe {
-        D3D11CreateDevice(
-            adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE::default(),
-            device_flags,
-            // 4x MSAA is required for Direct3D Feature Level 10.1 or better
+        D3D11On12CreateDevice(
+            d3d12_device,
+            device_flags.0 as u32,
             Some(&[
                 D3D_FEATURE_LEVEL_11_1,
                 D3D_FEATURE_LEVEL_11_0,
                 D3D_FEATURE_LEVEL_10_1,
             ]),
-            D3D11_SDK_VERSION,
+            Some(&[Some(command_queue)]),
+            0,
             Some(&mut device),
-            feature_level,
-            context,
+            Some(&mut context),
+            Some(&mut feature_level),
         )?;
     }
-    let device = device.unwrap();
+
+    let device = device.context("D3D11On12CreateDevice returned no D3D11 device")?;
+    validate_d3d11_device_features(&device)?;
+    let context = context.context("D3D11On12CreateDevice returned no D3D11 device context")?;
+    let d3d11on12_device = device
+        .cast()
+        .context("Casting D3D11 device to ID3D11On12Device")?;
+
+    Ok((device, context, d3d11on12_device, feature_level))
+}
+
+#[inline]
+fn clone_com_interface<T: Interface>(raw: *mut c_void, context: &'static str) -> Result<T> {
+    if raw.is_null() {
+        anyhow::bail!("{context}: null COM pointer");
+    }
+    unsafe { T::from_raw_borrowed(&raw) }
+        .cloned()
+        .with_context(|| context)
+}
+
+#[inline]
+fn validate_d3d11_device_features(device: &ID3D11Device) -> Result<()> {
     let mut data = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS::default();
     unsafe {
         device
@@ -185,7 +223,7 @@ fn get_device(
         .ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x
         .as_bool()
     {
-        Ok(device)
+        Ok(())
     } else {
         Err(anyhow::anyhow!(
             "Required feature StructuredBuffer is not supported by GPU/driver"

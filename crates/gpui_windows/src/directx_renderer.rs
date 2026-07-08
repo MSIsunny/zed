@@ -1,22 +1,31 @@
 use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    rc::Rc,
     slice,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::Ordering},
 };
 
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
+use gpui_wgpu::{
+    ExternalComposeOutput, ExternalWgpuContext, WgpuCompositorBackendCtx, WgpuExternalCompositor,
+    dx12_texture_resource_raw, wgpu,
+};
 use windows::{
     Win32::{
         Foundation::HWND,
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
+            Direct3D11on12::*,
+            Direct3D12::*,
             DirectComposition::*,
             DirectWrite::*,
             Dxgi::{Common::*, *},
         },
     },
-    core::Interface,
+    core::{IUnknown, Interface},
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
@@ -53,6 +62,10 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    wgpu_external_context_generation: u64,
+    frame_index: u64,
+    external_fence_value: u64,
+    pending_external_frames: VecDeque<(u64, Vec<WindowsComposeOutcome>)>,
 }
 
 /// Direct3D objects
@@ -62,6 +75,10 @@ pub(crate) struct DirectXRendererDevices {
     pub(crate) dxgi_factory: IDXGIFactory6,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
+    d3d11on12_device: ID3D11On12Device,
+    d3d12_queue: ID3D12CommandQueue,
+    external_wgpu_context: ExternalWgpuContext,
+    external_fence: ID3D12Fence,
     dxgi_device: Option<IDXGIDevice>,
 }
 
@@ -86,6 +103,7 @@ struct DirectXRenderPipelines {
     quad_pipeline: PipelineState<Quad>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
+    external_compositor_pipeline: PipelineState<ExternalCompositorSprite>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
@@ -103,6 +121,17 @@ struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
+#[derive(Clone)]
+enum WindowsComposeOutcome {
+    Ready {
+        _view: Arc<wgpu::TextureView>,
+        resource: ID3D11Resource,
+        shader_resource_view: Option<ID3D11ShaderResourceView>,
+        alpha_premultiplied: bool,
+    },
+    Skipped,
+}
+
 impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
@@ -113,11 +142,20 @@ impl DirectXRendererDevices {
             dxgi_factory,
             device,
             device_context,
+            d3d11on12_device,
+            d3d12_device,
+            d3d12_queue,
+            external_wgpu_context,
         } = directx_devices;
         let dxgi_device = if disable_direct_composition {
             None
         } else {
             Some(device.cast().context("Creating DXGI device")?)
+        };
+        let external_fence = unsafe {
+            d3d12_device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .context("Creating external compositor DX12 fence")?
         };
 
         Ok(Self {
@@ -125,6 +163,10 @@ impl DirectXRendererDevices {
             dxgi_factory: dxgi_factory.clone(),
             device: device.clone(),
             device_context: device_context.clone(),
+            d3d11on12_device: d3d11on12_device.clone(),
+            d3d12_queue: d3d12_queue.clone(),
+            external_wgpu_context: external_wgpu_context.clone(),
+            external_fence,
             dxgi_device,
         })
     }
@@ -174,6 +216,10 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            wgpu_external_context_generation: 1,
+            frame_index: 0,
+            external_fence_value: 0,
+            pending_external_frames: VecDeque::new(),
         })
     }
 
@@ -297,6 +343,10 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.wgpu_external_context_generation =
+            self.wgpu_external_context_generation.saturating_add(1);
+        self.external_fence_value = 0;
+        self.pending_external_frames.clear();
         self.skip_draws = true;
         Ok(())
     }
@@ -305,12 +355,17 @@ impl DirectXRenderer {
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
+        external_compositors: Option<Rc<RefCell<ExternalCompositorRegistry>>>,
     ) -> Result<()> {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        self.frame_index = self.frame_index.wrapping_add(1);
+        self.release_completed_external_frames();
+        let external_outcomes =
+            self.compose_external_compositors(scene, external_compositors.as_ref());
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -338,9 +393,10 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
-                // External composition is only implemented in the wgpu backend;
-                // the element's fallback quad covers this arm.
-                PrimitiveBatch::ExternalCompositors(_) => Ok(()),
+                PrimitiveBatch::ExternalCompositors(range) => self.draw_external_compositors(
+                    &scene.external_compositors[range],
+                    &external_outcomes,
+                ),
             }
             .context(format!(
                 "scene too large:\
@@ -354,6 +410,14 @@ impl DirectXRenderer {
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
             ))?;
+        }
+        self.flush_external_resources(&external_outcomes)?;
+        if let Some(registry) = external_compositors.as_ref() {
+            let mut registry = registry.borrow_mut();
+            for handle in external_outcomes.keys() {
+                registry.mark_processed(*handle);
+            }
+            registry.drain_pending_removals();
         }
         self.present()
     }
@@ -707,6 +771,317 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    fn compose_external_compositors(
+        &mut self,
+        scene: &Scene,
+        registry: Option<&Rc<RefCell<ExternalCompositorRegistry>>>,
+    ) -> HashMap<ExternalSlotHandle, WindowsComposeOutcome> {
+        let Some(registry) = registry else {
+            return HashMap::default();
+        };
+        if scene.external_compositors.is_empty() {
+            return HashMap::default();
+        }
+
+        let Some(devices) = self.devices.as_ref() else {
+            return HashMap::default();
+        };
+        if devices
+            .external_wgpu_context
+            .device_lost
+            .load(Ordering::Relaxed)
+        {
+            log::warn!("Windows external wgpu device was lost; invalidating external compositors");
+            self.invalidate_external_wgpu_context(registry);
+            return HashMap::default();
+        }
+
+        let device = Arc::clone(&devices.external_wgpu_context.device);
+        let queue = Arc::clone(&devices.external_wgpu_context.queue);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("windows_external_compositor_encoder"),
+        });
+
+        let mut raw_outcomes = HashMap::with_capacity(scene.external_compositors.len());
+        let mut composed_any = false;
+        for primitive in &scene.external_compositors {
+            let handle = primitive.handle;
+            if raw_outcomes.contains_key(&handle) {
+                continue;
+            }
+            let (outcome, did_compose) = self.compose_one_external_compositor(
+                handle,
+                registry,
+                &device,
+                &queue,
+                &mut encoder,
+            );
+            composed_any |= did_compose;
+            raw_outcomes.insert(handle, outcome);
+        }
+
+        let ready_views = raw_outcomes
+            .values()
+            .filter_map(|outcome| match outcome {
+                ExternalComposeOutput::Ready { view } => Some(Arc::clone(view)),
+                ExternalComposeOutput::NotReady | ExternalComposeOutput::ContextLost => None,
+            })
+            .collect::<Vec<_>>();
+        if !ready_views.is_empty() {
+            encoder.transition_resources(
+                std::iter::empty(),
+                ready_views.iter().map(|view| wgpu::TextureTransition {
+                    texture: view.texture(),
+                    selector: None,
+                    state: wgpu::TextureUses::RESOURCE,
+                }),
+            );
+        }
+        if composed_any {
+            queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        let mut outcomes = HashMap::with_capacity(raw_outcomes.len());
+        for (handle, output) in raw_outcomes {
+            let outcome = match output {
+                ExternalComposeOutput::Ready { view } => {
+                    let alpha_premultiplied =
+                        registry
+                            .borrow()
+                            .descriptor(handle)
+                            .is_some_and(|descriptor| {
+                                descriptor.alpha_mode == AlphaMode::PreMultiplied
+                            });
+                    match self.wrap_external_texture_view(Arc::clone(&view)) {
+                        Ok((resource, shader_resource_view)) => WindowsComposeOutcome::Ready {
+                            _view: view,
+                            resource,
+                            shader_resource_view,
+                            alpha_premultiplied,
+                        },
+                        Err(error) => {
+                            log::warn!(
+                                "failed to wrap external compositor texture for D3D11On12: {error}"
+                            );
+                            WindowsComposeOutcome::Skipped
+                        }
+                    }
+                }
+                ExternalComposeOutput::NotReady => WindowsComposeOutcome::Skipped,
+                ExternalComposeOutput::ContextLost => {
+                    self.invalidate_external_wgpu_context(registry);
+                    WindowsComposeOutcome::Skipped
+                }
+            };
+            outcomes.insert(handle, outcome);
+        }
+        outcomes
+    }
+
+    fn compose_one_external_compositor(
+        &mut self,
+        handle: ExternalSlotHandle,
+        registry: &Rc<RefCell<ExternalCompositorRegistry>>,
+        device: &Arc<wgpu::Device>,
+        queue: &Arc<wgpu::Queue>,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> (ExternalComposeOutput, bool) {
+        let context_generation = self.wgpu_external_context_generation;
+        let Some(slot_descriptor) = registry.borrow().descriptor(handle).cloned() else {
+            return (ExternalComposeOutput::NotReady, false);
+        };
+        if slot_descriptor.context_generation != context_generation {
+            return (ExternalComposeOutput::NotReady, false);
+        }
+
+        let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
+            return (ExternalComposeOutput::NotReady, false);
+        };
+        let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() else {
+            log::warn!(
+                "external compositor slot {handle:?} holds a compositor that is not a \
+                 `Box<dyn WgpuExternalCompositor>`"
+            );
+            registry.borrow_mut().put_back_compositor(handle, boxed);
+            return (ExternalComposeOutput::NotReady, false);
+        };
+
+        let mut ctx = WgpuCompositorBackendCtx {
+            device: Arc::clone(device),
+            queue: Arc::clone(queue),
+            encoder,
+            slot_descriptor,
+            context_generation,
+            frame_index: self.frame_index,
+            target_format: wgpu::TextureFormat::Bgra8Unorm,
+        };
+        let output = compositor.compose(handle, &mut ctx);
+        registry.borrow_mut().put_back_compositor(handle, boxed);
+        (output, true)
+    }
+
+    fn wrap_external_texture_view(
+        &self,
+        view: Arc<wgpu::TextureView>,
+    ) -> Result<(ID3D11Resource, Option<ID3D11ShaderResourceView>)> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let d3d12_resource_raw = unsafe { dx12_texture_resource_raw(&view) }?;
+        let d3d12_resource = unsafe { IUnknown::from_raw_borrowed(&d3d12_resource_raw) }
+            .context("Borrowing external compositor D3D12 texture resource")?
+            .clone();
+
+        let flags = D3D11_RESOURCE_FLAGS {
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            MiscFlags: 0,
+            CPUAccessFlags: 0,
+            StructureByteStride: 0,
+        };
+        let mut resource: Option<ID3D11Resource> = None;
+        unsafe {
+            devices.d3d11on12_device.CreateWrappedResource(
+                &d3d12_resource,
+                &flags,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                &mut resource,
+            )?;
+        }
+        let resource: ID3D11Resource =
+            resource.context("CreateWrappedResource returned no D3D11 resource")?;
+        let mut shader_resource_view = None;
+        unsafe {
+            devices.device.CreateShaderResourceView(
+                &resource,
+                None,
+                Some(&mut shader_resource_view),
+            )?;
+        }
+        Ok((resource, shader_resource_view))
+    }
+
+    fn invalidate_external_wgpu_context(
+        &mut self,
+        registry: &Rc<RefCell<ExternalCompositorRegistry>>,
+    ) {
+        self.wgpu_external_context_generation =
+            self.wgpu_external_context_generation.saturating_add(1);
+        let new_generation = self.wgpu_external_context_generation;
+        let handles = {
+            let mut registry = registry.borrow_mut();
+            registry.on_context_recreated(new_generation);
+            registry.occupied_handles().collect::<Vec<_>>()
+        };
+        for handle in handles {
+            let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
+                continue;
+            };
+            if let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() {
+                compositor.on_context_recreated(new_generation);
+            }
+            registry.borrow_mut().put_back_compositor(handle, boxed);
+        }
+    }
+
+    fn draw_external_compositors(
+        &mut self,
+        external_compositors: &[ExternalCompositorPrimitive],
+        outcomes: &HashMap<ExternalSlotHandle, WindowsComposeOutcome>,
+    ) -> Result<()> {
+        if external_compositors.is_empty() {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        for primitive in external_compositors {
+            let Some(WindowsComposeOutcome::Ready {
+                resource,
+                shader_resource_view,
+                alpha_premultiplied,
+                ..
+            }) = outcomes.get(&primitive.handle)
+            else {
+                continue;
+            };
+            let sprite = ExternalCompositorSprite {
+                bounds: primitive.bounds,
+                content_mask: primitive.content_mask,
+                alpha_premultiplied: *alpha_premultiplied as u32,
+                _pad: [0; 3],
+            };
+            self.pipelines.external_compositor_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                slice::from_ref(&sprite),
+            )?;
+            let wrapped_resources = [Some(resource.clone())];
+            unsafe {
+                devices
+                    .d3d11on12_device
+                    .AcquireWrappedResources(&wrapped_resources);
+            }
+            self.pipelines
+                .external_compositor_pipeline
+                .draw_with_texture(
+                    &devices.device_context,
+                    slice::from_ref(shader_resource_view),
+                    slice::from_ref(&resources.viewport),
+                    slice::from_ref(&self.globals.global_params_buffer),
+                    slice::from_ref(&self.globals.sampler),
+                    1,
+                )?;
+            unsafe {
+                devices
+                    .d3d11on12_device
+                    .ReleaseWrappedResources(&wrapped_resources);
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_external_resources(
+        &mut self,
+        outcomes: &HashMap<ExternalSlotHandle, WindowsComposeOutcome>,
+    ) -> Result<()> {
+        let retained = outcomes
+            .values()
+            .filter_map(|outcome| match outcome {
+                WindowsComposeOutcome::Ready { .. } => Some(outcome.clone()),
+                WindowsComposeOutcome::Skipped => None,
+            })
+            .collect::<Vec<_>>();
+        if retained.is_empty() {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        unsafe {
+            devices.device_context.Flush();
+            self.external_fence_value = self.external_fence_value.saturating_add(1);
+            devices
+                .d3d12_queue
+                .Signal(&devices.external_fence, self.external_fence_value)
+                .context("Signaling external compositor fence")?;
+        }
+        self.pending_external_frames
+            .push_back((self.external_fence_value, retained));
+        self.release_completed_external_frames();
+        Ok(())
+    }
+
+    fn release_completed_external_frames(&mut self) {
+        let Some(devices) = self.devices.as_ref() else {
+            self.pending_external_frames.clear();
+            return;
+        };
+        let completed = unsafe { devices.external_fence.GetCompletedValue() };
+        while self
+            .pending_external_frames
+            .front()
+            .is_some_and(|(fence_value, _)| *fence_value <= completed)
+        {
+            self.pending_external_frames.pop_front();
+        }
+    }
+
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let desc = unsafe { devices.adapter.GetDesc1() }?;
@@ -754,6 +1129,27 @@ impl DirectXRenderer {
 
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
+    }
+
+    pub(crate) fn notify_external_context_recreated(
+        &self,
+        registry: &Rc<RefCell<ExternalCompositorRegistry>>,
+    ) {
+        let new_generation = self.wgpu_external_context_generation;
+        let handles = {
+            let mut registry = registry.borrow_mut();
+            registry.on_context_recreated(new_generation);
+            registry.occupied_handles().collect::<Vec<_>>()
+        };
+        for handle in handles {
+            let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
+                continue;
+            };
+            if let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() {
+                compositor.on_context_recreated(new_generation);
+            }
+            registry.borrow_mut().put_back_compositor(handle, boxed);
+        }
     }
 }
 
@@ -856,6 +1252,13 @@ impl DirectXRenderPipelines {
             4,
             create_blend_state_for_path_sprite(device)?,
         )?;
+        let external_compositor_pipeline = PipelineState::new(
+            device,
+            "external_compositor_pipeline",
+            ShaderModule::ExternalCompositor,
+            4,
+            create_blend_state_for_path_sprite(device)?,
+        )?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
@@ -890,6 +1293,7 @@ impl DirectXRenderPipelines {
             quad_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
+            external_compositor_pipeline,
             underline_pipeline,
             mono_sprites,
             subpixel_sprites,
@@ -1163,6 +1567,15 @@ struct PathRasterizationSprite {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ExternalCompositorSprite {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    alpha_premultiplied: u32,
+    _pad: [u32; 3],
 }
 
 impl Drop for DirectXRenderer {
@@ -1603,6 +2016,7 @@ pub(crate) mod shader_resources {
         Underline,
         PathRasterization,
         PathSprite,
+        ExternalCompositor,
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
@@ -1667,6 +2081,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PathSprite => match target {
                     ShaderTarget::Vertex => PATH_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => PATH_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::ExternalCompositor => match target {
+                    ShaderTarget::Vertex => EXTERNAL_COMPOSITOR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => EXTERNAL_COMPOSITOR_FRAGMENT_BYTES,
                 },
                 ShaderModule::MonochromeSprite => match target {
                     ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
@@ -1767,6 +2185,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",
                 ShaderModule::PathSprite => "path_sprite",
+                ShaderModule::ExternalCompositor => "external_compositor",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
