@@ -441,7 +441,7 @@ impl WgpuContext {
     }
 
     /// Returns a clone of the device_lost flag for sharing with renderers.
-    pub(crate) fn device_lost_flag(&self) -> Arc<AtomicBool> {
+    pub fn device_lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.device_lost)
     }
 }

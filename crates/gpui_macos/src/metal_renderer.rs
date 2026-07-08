@@ -12,7 +12,10 @@ use gpui::{
     PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
     Size, Surface, Underline, point, size,
 };
-use gpui_wgpu::{ExternalComposeOutput, WgpuCompositorBackendCtx, WgpuExternalCompositor, wgpu};
+use gpui_wgpu::{
+    ExternalComposeOutput, ExternalWgpuContext, WgpuCompositorBackendCtx, WgpuExternalCompositor,
+    wgpu,
+};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
@@ -35,10 +38,7 @@ use std::{
     ffi::c_void,
     mem, ptr,
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
@@ -147,19 +147,13 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
-    wgpu_external_context: Option<MacWgpuExternalContext>,
+    wgpu_external_context: Option<ExternalWgpuContext>,
     wgpu_external_context_generation: u64,
     frame_index: u64,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
-}
-
-struct MacWgpuExternalContext {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-    device_lost: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -1704,7 +1698,9 @@ impl MetalRenderer {
         }
 
         if self.wgpu_external_context.is_none() {
-            match MacWgpuExternalContext::new(&self.device) {
+            match unsafe {
+                ExternalWgpuContext::from_metal_device(self.device.as_ptr() as *mut c_void)
+            } {
                 Ok(context) => {
                     self.wgpu_external_context = Some(context);
                 }
@@ -1932,82 +1928,6 @@ impl MetalRenderer {
         command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
         *instance_offset = next_offset;
         true
-    }
-}
-
-impl MacWgpuExternalContext {
-    fn new(metal_device: &metal::DeviceRef) -> Result<Self> {
-        futures::executor::block_on(async {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::METAL,
-                flags: wgpu::InstanceFlags::default(),
-                backend_options: wgpu::BackendOptions::default(),
-                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                display: None,
-            });
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                })
-                .await
-                .map_err(|error| anyhow::anyhow!("failed to request adapter: {error}"))?;
-            let adapter_info = adapter.get_info();
-            log::info!(
-                "macOS external compositor selected wgpu adapter: {} ({:?})",
-                adapter_info.name,
-                adapter_info.backend
-            );
-            let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("gpui_macos_external_compositor_device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults()
-                        .using_resolution(adapter.limits())
-                        .using_alignment(adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                    trace: wgpu::Trace::Off,
-                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                })
-                .await
-                .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
-            Self::validate_metal_device(&device, metal_device)?;
-            let device_lost = Arc::new(AtomicBool::new(false));
-            device.set_device_lost_callback({
-                let device_lost = Arc::clone(&device_lost);
-                move |reason, message| {
-                    log::error!(
-                        "macOS external compositor wgpu device lost: reason={reason:?}, \
-                         message={message}"
-                    );
-                    if reason != wgpu::DeviceLostReason::Destroyed {
-                        device_lost.store(true, Ordering::Relaxed);
-                    }
-                }
-            });
-            Ok(Self {
-                device: Arc::new(device),
-                queue: Arc::new(queue),
-                device_lost,
-            })
-        })
-    }
-
-    fn validate_metal_device(device: &wgpu::Device, metal_device: &metal::DeviceRef) -> Result<()> {
-        let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Metal>() }) else {
-            anyhow::bail!("external compositor wgpu device is not backed by Metal");
-        };
-        let wgpu_metal_device =
-            objc2::rc::Retained::as_ptr(hal_device.raw_device()) as *const c_void;
-        let gpui_metal_device = metal_device.as_ptr() as *const c_void;
-        if wgpu_metal_device != gpui_metal_device {
-            anyhow::bail!(
-                "external compositor wgpu Metal device ({wgpu_metal_device:p}) does not match \
-                 GPUI Metal device ({gpui_metal_device:p})"
-            );
-        }
-        Ok(())
     }
 }
 

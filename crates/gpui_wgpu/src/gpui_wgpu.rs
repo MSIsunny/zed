@@ -1,9 +1,11 @@
 mod cosmic_text_system;
+mod external_context;
 mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;
 
 pub use cosmic_text_system::*;
+pub use external_context::*;
 pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;
