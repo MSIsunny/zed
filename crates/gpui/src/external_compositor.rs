@@ -328,6 +328,35 @@ impl ExternalCompositorRegistry {
         Ok(ExternalSlotHandle { index, generation })
     }
 
+    /// Updates a live slot's target size, in device texels. The slot handle,
+    /// compositor, format, alpha mode, sample count, and context generation are
+    /// preserved. Backends pass the updated descriptor to the compositor on its next
+    /// compose call, allowing it to recreate size-dependent GPU resources without
+    /// unregistering and reallocating the slot.
+    pub fn resize(
+        &mut self,
+        handle: ExternalSlotHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ExternalCompositorError> {
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err(ExternalCompositorError::InvalidDimensions { width, height });
+        }
+
+        let Some(slot) = self.resolve_mut(handle) else {
+            return Err(ExternalCompositorError::StaleHandle);
+        };
+        if slot.context_stale || slot.pending_removal {
+            return Err(ExternalCompositorError::StaleHandle);
+        }
+        let Some(descriptor) = slot.descriptor.as_mut() else {
+            return Err(ExternalCompositorError::StaleHandle);
+        };
+        descriptor.width = width;
+        descriptor.height = height;
+        Ok(())
+    }
+
     /// Unregisters a slot.
     ///
     /// Three distinct cases:
@@ -850,5 +879,59 @@ mod tests {
         let size = registry.slot_size(handle).unwrap();
         assert_eq!(size.width, DevicePixels(64));
         assert_eq!(size.height, DevicePixels(64));
+    }
+
+    #[test]
+    fn resize_updates_live_slot_dimensions() {
+        let mut registry = ExternalCompositorRegistry::new();
+        let handle = registry
+            .register(descriptor(1), dummy_compositor())
+            .unwrap();
+
+        registry.resize(handle, 128, 96).unwrap();
+
+        let descriptor = registry.descriptor(handle).unwrap();
+        assert_eq!(descriptor.width, 128);
+        assert_eq!(descriptor.height, 96);
+        let size = registry.slot_size(handle).unwrap();
+        assert_eq!(size.width, DevicePixels(128));
+        assert_eq!(size.height, DevicePixels(96));
+    }
+
+    #[test]
+    fn resize_rejects_invalid_or_non_live_slots() {
+        let mut registry = ExternalCompositorRegistry::new();
+        let handle = registry
+            .register(descriptor(1), dummy_compositor())
+            .unwrap();
+
+        assert!(matches!(
+            registry.resize(handle, 0, 96),
+            Err(ExternalCompositorError::InvalidDimensions {
+                width: 0,
+                height: 96
+            })
+        ));
+
+        registry.mark_painted(handle, 1);
+        assert!(matches!(
+            registry.unregister(handle),
+            Ok(UnregisterOutcome::Deferred {
+                until_after_frame: 1
+            })
+        ));
+        assert!(matches!(
+            registry.resize(handle, 128, 96),
+            Err(ExternalCompositorError::StaleHandle)
+        ));
+
+        let stale = registry
+            .register(descriptor(1), dummy_compositor())
+            .unwrap();
+        registry.on_context_recreated(2);
+        assert!(matches!(
+            registry.resize(stale, 128, 96),
+            Err(ExternalCompositorError::StaleHandle)
+        ));
     }
 }

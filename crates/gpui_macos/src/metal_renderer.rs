@@ -35,7 +35,10 @@ use std::{
     ffi::c_void,
     mem, ptr,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -156,6 +159,7 @@ pub(crate) struct MetalRenderer {
 struct MacWgpuExternalContext {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    device_lost: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -165,6 +169,15 @@ enum MacComposeOutcome {
         alpha_premultiplied: bool,
     },
     Skipped,
+}
+
+impl MacComposeOutcome {
+    fn view(&self) -> Option<Arc<wgpu::TextureView>> {
+        match self {
+            Self::Ready { view, .. } => Some(view.clone()),
+            Self::Skipped => None,
+        }
+    }
 }
 
 #[repr(C)]
@@ -533,7 +546,10 @@ impl MetalRenderer {
                 Ok(command_buffer) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
+                    let retained_external_views =
+                        Self::retain_external_texture_views(&external_outcomes);
                     let block = ConcreteBlock::new(move |_| {
+                        let _retained_external_views = &retained_external_views;
                         if let Some(instance_buffer) = instance_buffer.take() {
                             instance_buffer_pool.lock().release(instance_buffer);
                         }
@@ -1656,6 +1672,15 @@ impl MetalRenderer {
         true
     }
 
+    fn retain_external_texture_views(
+        outcomes: &HashMap<ExternalSlotHandle, MacComposeOutcome>,
+    ) -> Vec<Arc<wgpu::TextureView>> {
+        outcomes
+            .values()
+            .filter_map(MacComposeOutcome::view)
+            .collect()
+    }
+
     fn compose_external_compositors(
         &mut self,
         scene: &Scene,
@@ -1668,14 +1693,61 @@ impl MetalRenderer {
             return HashMap::default();
         }
 
+        if self
+            .wgpu_external_context
+            .as_ref()
+            .is_some_and(|context| context.device_lost.load(Ordering::Relaxed))
+        {
+            log::warn!("macOS external wgpu device was lost; invalidating external compositors");
+            self.invalidate_external_wgpu_context(registry);
+            return HashMap::default();
+        }
+
+        if self.wgpu_external_context.is_none() {
+            match MacWgpuExternalContext::new(&self.device) {
+                Ok(context) => {
+                    self.wgpu_external_context = Some(context);
+                }
+                Err(error) => {
+                    log::error!("failed to initialize macOS external wgpu context: {error}");
+                    return HashMap::default();
+                }
+            }
+        }
+        let Some(context) = self.wgpu_external_context.as_ref() else {
+            return HashMap::default();
+        };
+        let device = Arc::clone(&context.device);
+        let queue = Arc::clone(&context.queue);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("macos_external_compositor_encoder"),
+        });
+
         let mut outcomes = HashMap::with_capacity(scene.external_compositors.len());
+        let mut composed_any = false;
         for primitive in &scene.external_compositors {
             let handle = primitive.handle;
             if outcomes.contains_key(&handle) {
                 continue;
             }
-            let outcome = self.compose_one_external_compositor(handle, registry);
+            let (outcome, did_compose) = self.compose_one_external_compositor(
+                handle,
+                registry,
+                &device,
+                &queue,
+                &mut encoder,
+            );
+            composed_any |= did_compose;
             outcomes.insert(handle, outcome);
+        }
+        if composed_any {
+            let submission_index = queue.submit(std::iter::once(encoder.finish()));
+            if let Err(error) = device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission_index),
+                timeout: Some(Duration::from_secs(1)),
+            }) {
+                log::warn!("waiting for macOS external wgpu composition failed: {error}");
+            }
         }
         outcomes
     }
@@ -1684,36 +1756,20 @@ impl MetalRenderer {
         &mut self,
         handle: ExternalSlotHandle,
         registry: &Rc<RefCell<ExternalCompositorRegistry>>,
-    ) -> MacComposeOutcome {
+        device: &Arc<wgpu::Device>,
+        queue: &Arc<wgpu::Queue>,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> (MacComposeOutcome, bool) {
         let context_generation = self.wgpu_external_context_generation;
-        let Some(descriptor_generation) = registry
-            .borrow()
-            .descriptor(handle)
-            .map(|descriptor| descriptor.context_generation)
-        else {
-            return MacComposeOutcome::Skipped;
+        let Some(slot_descriptor) = registry.borrow().descriptor(handle).cloned() else {
+            return (MacComposeOutcome::Skipped, false);
         };
-        if descriptor_generation != context_generation {
-            return MacComposeOutcome::Skipped;
-        }
-
-        if self.wgpu_external_context.is_none() {
-            match MacWgpuExternalContext::new() {
-                Ok(context) => {
-                    self.wgpu_external_context = Some(context);
-                }
-                Err(error) => {
-                    log::error!("failed to initialize macOS external wgpu context: {error}");
-                    return MacComposeOutcome::Skipped;
-                }
-            }
-        }
-        let Some(context) = self.wgpu_external_context.as_ref() else {
-            return MacComposeOutcome::Skipped;
+        if slot_descriptor.context_generation != context_generation {
+            return (MacComposeOutcome::Skipped, false);
         };
 
         let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
-            return MacComposeOutcome::Skipped;
+            return (MacComposeOutcome::Skipped, false);
         };
         let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() else {
             log::warn!(
@@ -1721,18 +1777,14 @@ impl MetalRenderer {
                  `Box<dyn WgpuExternalCompositor>`"
             );
             registry.borrow_mut().put_back_compositor(handle, boxed);
-            return MacComposeOutcome::Skipped;
+            return (MacComposeOutcome::Skipped, false);
         };
 
-        let mut encoder = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("macos_external_compositor_encoder"),
-            });
         let mut ctx = WgpuCompositorBackendCtx {
-            device: Arc::clone(&context.device),
-            queue: Arc::clone(&context.queue),
-            encoder: &mut encoder,
+            device: Arc::clone(device),
+            queue: Arc::clone(queue),
+            encoder,
+            slot_descriptor: slot_descriptor.clone(),
             context_generation,
             frame_index: self.frame_index,
             target_format: wgpu::TextureFormat::Bgra8Unorm,
@@ -1740,21 +1792,9 @@ impl MetalRenderer {
         let result = compositor.compose(handle, &mut ctx);
         registry.borrow_mut().put_back_compositor(handle, boxed);
 
-        let submission_index = context.queue.submit(std::iter::once(encoder.finish()));
-        if let Err(error) = context.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submission_index),
-            timeout: Some(Duration::from_secs(1)),
-        }) {
-            log::warn!("waiting for macOS external wgpu composition failed: {error}");
-        }
-
-        match result {
+        let outcome = match result {
             ExternalComposeOutput::Ready { view } => {
-                let alpha_premultiplied = registry
-                    .borrow()
-                    .descriptor(handle)
-                    .map(|descriptor| descriptor.alpha_mode == AlphaMode::PreMultiplied)
-                    .unwrap_or(true);
+                let alpha_premultiplied = slot_descriptor.alpha_mode == AlphaMode::PreMultiplied;
                 MacComposeOutcome::Ready {
                     view,
                     alpha_premultiplied,
@@ -1765,7 +1805,8 @@ impl MetalRenderer {
                 self.invalidate_external_wgpu_context(registry);
                 MacComposeOutcome::Skipped
             }
-        }
+        };
+        (outcome, true)
     }
 
     fn invalidate_external_wgpu_context(
@@ -1895,7 +1936,7 @@ impl MetalRenderer {
 }
 
 impl MacWgpuExternalContext {
-    fn new() -> Result<Self> {
+    fn new(metal_device: &metal::DeviceRef) -> Result<Self> {
         futures::executor::block_on(async {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::METAL,
@@ -1931,11 +1972,42 @@ impl MacWgpuExternalContext {
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
+            Self::validate_metal_device(&device, metal_device)?;
+            let device_lost = Arc::new(AtomicBool::new(false));
+            device.set_device_lost_callback({
+                let device_lost = Arc::clone(&device_lost);
+                move |reason, message| {
+                    log::error!(
+                        "macOS external compositor wgpu device lost: reason={reason:?}, \
+                         message={message}"
+                    );
+                    if reason != wgpu::DeviceLostReason::Destroyed {
+                        device_lost.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
             Ok(Self {
                 device: Arc::new(device),
                 queue: Arc::new(queue),
+                device_lost,
             })
         })
+    }
+
+    fn validate_metal_device(device: &wgpu::Device, metal_device: &metal::DeviceRef) -> Result<()> {
+        let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Metal>() }) else {
+            anyhow::bail!("external compositor wgpu device is not backed by Metal");
+        };
+        let wgpu_metal_device =
+            objc2::rc::Retained::as_ptr(hal_device.raw_device()) as *const c_void;
+        let gpui_metal_device = metal_device.as_ptr() as *const c_void;
+        if wgpu_metal_device != gpui_metal_device {
+            anyhow::bail!(
+                "external compositor wgpu Metal device ({wgpu_metal_device:p}) does not match \
+                 GPUI Metal device ({gpui_metal_device:p})"
+            );
+        }
+        Ok(())
     }
 }
 

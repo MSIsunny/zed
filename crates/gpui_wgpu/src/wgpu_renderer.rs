@@ -152,6 +152,10 @@ pub struct WgpuCompositorBackendCtx<'a> {
     /// as the rest of the frame. Unlike `device`/`queue`, this is a genuine
     /// frame-scoped borrow: do not retain it past `compose`.
     pub encoder: &'a mut wgpu::CommandEncoder,
+    /// The slot descriptor currently registered for this handle. Compositors should
+    /// treat `width`/`height` as the authoritative device-texel size for
+    /// size-dependent render targets and recreate those resources when it changes.
+    pub slot_descriptor: ExternalSlotDescriptor,
     /// The renderer's current graphics context generation (see
     /// [`ExternalCompositorRegistry::current_context_generation`] and
     /// [`GpuContext`]/`SharedGpuContext`, which is this value's single source of
@@ -1838,20 +1842,17 @@ impl WgpuRenderer {
         // and register a fresh one. This is *not* treated as a fresh device-loss
         // signal (unlike a `ContextLost` result from `compose` itself): the device
         // is fine, this slot is simply waiting on the app to catch up.
-        let Some(descriptor_generation) = registry
-            .borrow()
-            .descriptor(handle)
-            .map(|descriptor| descriptor.context_generation)
-        else {
+        let Some(slot_descriptor) = registry.borrow().descriptor(handle).cloned() else {
             // Unknown/fully-freed handle. Nothing to compose; the element's own
             // background (if any) shows through this frame's `Load` pass.
             return ComposeOutcome::Skipped;
         };
-        if descriptor_generation != context_generation {
+        if slot_descriptor.context_generation != context_generation {
             log::debug!(
                 "external compositor slot {handle:?} belongs to graphics context \
-                 generation {descriptor_generation}, current is {context_generation}; \
-                 skipping composition until the app re-registers"
+                 generation {}, current is {context_generation}; \
+                 skipping composition until the app re-registers",
+                slot_descriptor.context_generation
             );
             return ComposeOutcome::Skipped;
         }
@@ -1872,6 +1873,7 @@ impl WgpuRenderer {
             device: Arc::clone(device),
             queue: Arc::clone(queue),
             encoder,
+            slot_descriptor: slot_descriptor.clone(),
             context_generation,
             frame_index: self.frame_index,
             target_format,
@@ -1884,11 +1886,7 @@ impl WgpuRenderer {
 
         match result {
             ExternalComposeOutput::Ready { view } => {
-                let alpha_premultiplied = registry
-                    .borrow()
-                    .descriptor(handle)
-                    .map(|descriptor| descriptor.alpha_mode == AlphaMode::PreMultiplied)
-                    .unwrap_or(true);
+                let alpha_premultiplied = slot_descriptor.alpha_mode == AlphaMode::PreMultiplied;
                 ComposeOutcome::Ready {
                     view,
                     alpha_premultiplied,

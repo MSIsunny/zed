@@ -47,6 +47,13 @@ impl DemoTextureSize {
             height: logical_pixels_to_device_texels(DISPLAY_SIZE, scale_factor),
         }
     }
+
+    fn from_descriptor(descriptor: &ExternalSlotDescriptor) -> Self {
+        Self {
+            width: descriptor.width,
+            height: descriptor.height,
+        }
+    }
 }
 
 fn logical_pixels_to_device_texels(logical_pixels: f32, scale_factor: f32) -> u32 {
@@ -67,12 +74,12 @@ fn exit_after_frames() -> Option<u64> {
 /// image.
 #[cfg(not(target_family = "wasm"))]
 struct DemoCompositor {
-    texture_size: DemoTextureSize,
     resources: Option<DemoResources>,
 }
 
 #[cfg(not(target_family = "wasm"))]
 struct DemoResources {
+    texture_size: DemoTextureSize,
     _texture: wgpu::Texture,
     view: Arc<wgpu::TextureView>,
     pipeline: wgpu::RenderPipeline,
@@ -82,19 +89,19 @@ struct DemoResources {
 
 #[cfg(not(target_family = "wasm"))]
 impl DemoCompositor {
-    fn new(texture_size: DemoTextureSize) -> Self {
-        Self {
-            texture_size,
-            resources: None,
-        }
+    fn new() -> Self {
+        Self { resources: None }
     }
 
-    fn create_resources(&self, ctx: &mut WgpuCompositorBackendCtx<'_>) -> DemoResources {
+    fn create_resources(
+        ctx: &mut WgpuCompositorBackendCtx<'_>,
+        texture_size: DemoTextureSize,
+    ) -> DemoResources {
         let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("external_compositor_example_demo_texture"),
             size: wgpu::Extent3d {
-                width: self.texture_size.width,
-                height: self.texture_size.height,
+                width: texture_size.width,
+                height: texture_size.height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -243,6 +250,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             });
 
         DemoResources {
+            texture_size,
             _texture: texture,
             view,
             pipeline,
@@ -259,16 +267,21 @@ impl WgpuExternalCompositor for DemoCompositor {
         _slot: ExternalSlotHandle,
         ctx: &mut WgpuCompositorBackendCtx<'_>,
     ) -> ExternalComposeOutput {
-        if self.resources.is_none() {
+        let texture_size = DemoTextureSize::from_descriptor(&ctx.slot_descriptor);
+        if self
+            .resources
+            .as_ref()
+            .is_none_or(|resources| resources.texture_size != texture_size)
+        {
             log::info!(
                 "external_compositor example: creating {}x{} demo wgpu \
                  render target (swapchain target format {:?}, context generation {})",
-                self.texture_size.width,
-                self.texture_size.height,
+                texture_size.width,
+                texture_size.height,
                 ctx.target_format,
                 ctx.context_generation,
             );
-            self.resources = Some(self.create_resources(ctx));
+            self.resources = Some(Self::create_resources(ctx, texture_size));
         }
         let Some(resources) = self.resources.as_ref() else {
             return ExternalComposeOutput::NotReady;
@@ -347,24 +360,43 @@ impl ExternalCompositorDemo {
         };
 
         let texture_size = DemoTextureSize::for_window(window);
-        let needs_register = match self.handle {
-            Some(handle) => {
-                !registry.borrow().is_valid(handle) || self.texture_size != Some(texture_size)
-            }
-            None => true,
-        };
-        if !needs_register {
-            return;
-        }
-
-        if let Some(old_handle) = self.handle.take() {
-            self.texture_size = None;
-            // The previous handle went stale (a graphics context recreation
-            // happened): this is `unregister`'s context-recreation cleanup case —
-            // it frees the slot immediately, no frame-in-flight deferral, since a
-            // stale slot is never composed.
-            if let Err(error) = registry.borrow_mut().unregister(old_handle) {
-                log::debug!("external_compositor example: stale slot cleanup: {error}");
+        if let Some(handle) = self.handle {
+            if !registry.borrow().is_valid(handle) {
+                if let Err(error) = registry.borrow_mut().unregister(handle) {
+                    log::debug!("external_compositor example: stale slot cleanup: {error}");
+                }
+                self.handle = None;
+                self.texture_size = None;
+            } else if self.texture_size != Some(texture_size) {
+                match registry
+                    .borrow_mut()
+                    .resize(handle, texture_size.width, texture_size.height)
+                {
+                    Ok(()) => {
+                        self.texture_size = Some(texture_size);
+                        self.status = format!(
+                            "compositor resized — {}x{} texels @ {:.2}x",
+                            texture_size.width,
+                            texture_size.height,
+                            window.scale_factor(),
+                        )
+                        .into();
+                        return;
+                    }
+                    Err(error) => {
+                        log::debug!("external_compositor example: resize failed: {error}");
+                        if let Err(error) = registry.borrow_mut().unregister(handle) {
+                            log::debug!(
+                                "external_compositor example: failed to clean up after resize \
+                                 failure: {error}"
+                            );
+                        }
+                        self.handle = None;
+                        self.texture_size = None;
+                    }
+                }
+            } else {
+                return;
             }
         }
 
@@ -393,8 +425,7 @@ impl ExternalCompositorDemo {
             sample_count: 1,
             context_generation: generation,
         };
-        match register_external_compositor(&registry, descriptor, DemoCompositor::new(texture_size))
-        {
+        match register_external_compositor(&registry, descriptor, DemoCompositor::new()) {
             Ok(handle) => {
                 self.handle = Some(handle);
                 self.texture_size = Some(texture_size);
