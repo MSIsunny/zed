@@ -66,6 +66,8 @@ impl Default for ExternalSlotHandle {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExternalSlotFormat {
+    /// 8-bit RGBA, linear.
+    Rgba8Unorm,
     /// 8-bit RGBA, sRGB-encoded.
     Rgba8UnormSrgb,
     /// 8-bit BGRA, sRGB-encoded.
