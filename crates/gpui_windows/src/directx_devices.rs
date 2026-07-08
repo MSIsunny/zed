@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
+use gpui_util::ResultExt;
 use gpui_wgpu::{Dx12ExternalWgpuContext, ExternalWgpuContext};
 use itertools::Itertools;
-use std::ffi::c_void;
 use windows::Win32::Graphics::{
     Direct3D::{
         D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -53,14 +53,14 @@ impl DirectXDevices {
             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
         let dx12_context =
             Dx12ExternalWgpuContext::new().context("Creating DX12 external wgpu context")?;
-        let d3d12_device: ID3D12Device = clone_com_interface(
-            dx12_context.d3d12_device_raw,
-            "Borrowing external wgpu D3D12 device",
-        )?;
-        let d3d12_queue: ID3D12CommandQueue = clone_com_interface(
-            dx12_context.d3d12_queue_raw,
-            "Borrowing external wgpu D3D12 command queue",
-        )?;
+        let d3d12_device: ID3D12Device = dx12_context
+            .d3d12_device
+            .cast()
+            .context("Casting external wgpu DX12 device")?;
+        let d3d12_queue: ID3D12CommandQueue = dx12_context
+            .d3d12_queue
+            .cast()
+            .context("Casting external wgpu DX12 command queue")?;
         let adapter = get_adapter_by_luid(&dxgi_factory, &d3d12_device)
             .context("Getting DXGI adapter for external wgpu DX12 device")?;
         log_adapter_info(&adapter);
@@ -195,16 +195,6 @@ fn create_d3d11on12_device(
         .context("Casting D3D11 device to ID3D11On12Device")?;
 
     Ok((device, context, d3d11on12_device, feature_level))
-}
-
-#[inline]
-fn clone_com_interface<T: Interface>(raw: *mut c_void, context: &'static str) -> Result<T> {
-    if raw.is_null() {
-        anyhow::bail!("{context}: null COM pointer");
-    }
-    unsafe { T::from_raw_borrowed(&raw) }
-        .cloned()
-        .with_context(|| context)
 }
 
 #[inline]

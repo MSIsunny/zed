@@ -1,9 +1,6 @@
-use std::{
-    ffi::c_void,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 #[derive(Clone)]
@@ -68,8 +65,8 @@ impl ExternalWgpuContext {
 #[cfg(target_os = "windows")]
 pub struct Dx12ExternalWgpuContext {
     pub context: ExternalWgpuContext,
-    pub d3d12_device_raw: *mut c_void,
-    pub d3d12_queue_raw: *mut c_void,
+    pub d3d12_device: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    pub d3d12_queue: windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
 }
 
 #[cfg(target_os = "windows")]
@@ -80,10 +77,30 @@ impl Dx12ExternalWgpuContext {
 }
 
 #[cfg(target_os = "windows")]
-pub unsafe fn dx12_texture_resource_raw(
-    texture_view: &wgpu::TextureView,
-) -> anyhow::Result<*mut c_void> {
-    unsafe { windows_dx12::texture_resource_raw(texture_view) }
+#[derive(Clone)]
+pub struct Dx12ExternalTextureResource {
+    view: Arc<wgpu::TextureView>,
+    resource: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    resource_identity: usize,
+}
+
+#[cfg(target_os = "windows")]
+impl Dx12ExternalTextureResource {
+    pub fn new(view: Arc<wgpu::TextureView>) -> anyhow::Result<Self> {
+        unsafe { windows_dx12::texture_resource(view) }
+    }
+
+    pub fn view(&self) -> &Arc<wgpu::TextureView> {
+        &self.view
+    }
+
+    pub fn resource(&self) -> &windows::Win32::Graphics::Direct3D12::ID3D12Resource {
+        &self.resource
+    }
+
+    pub fn resource_identity(&self) -> usize {
+        self.resource_identity
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -179,10 +196,10 @@ mod macos {
 
 #[cfg(target_os = "windows")]
 mod windows_dx12 {
-    use super::{Dx12ExternalWgpuContext, ExternalWgpuContext};
+    use super::{Dx12ExternalTextureResource, Dx12ExternalWgpuContext, ExternalWgpuContext};
     use anyhow::Context as _;
-    use std::ffi::c_void;
-    use windows_core_062::Interface as _;
+    use std::sync::Arc;
+    use windows::core::Interface;
 
     pub(super) fn new_dx12_external_context() -> anyhow::Result<Dx12ExternalWgpuContext> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -223,17 +240,17 @@ mod windows_dx12 {
         )
         .context("failed to create DX12 wgpu device for external compositing")?;
 
-        let (d3d12_device_raw, d3d12_queue_raw) = {
+        let (d3d12_device, d3d12_queue) = {
             let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }) else {
                 anyhow::bail!("external compositor wgpu device is not backed by DX12");
             };
             (
-                hal_device.raw_device().as_raw(),
-                hal_device.raw_queue().as_raw(),
+                hal_device.raw_device().clone(),
+                hal_device.raw_queue().clone(),
             )
         };
 
-        validate_dx12_handles(&device, d3d12_device_raw, d3d12_queue_raw)?;
+        validate_dx12_handles(&device, &d3d12_device, &d3d12_queue)?;
 
         log::info!(
             "external compositor wgpu context is backed by DX12: {} ({:?})",
@@ -243,33 +260,35 @@ mod windows_dx12 {
 
         Ok(Dx12ExternalWgpuContext {
             context: ExternalWgpuContext::new(device, queue),
-            d3d12_device_raw,
-            d3d12_queue_raw,
+            d3d12_device,
+            d3d12_queue,
         })
     }
 
     fn validate_dx12_handles(
         device: &wgpu::Device,
-        d3d12_device_raw: *mut c_void,
-        d3d12_queue_raw: *mut c_void,
+        d3d12_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        d3d12_queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
     ) -> anyhow::Result<()> {
         let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }) else {
             anyhow::bail!("external compositor wgpu device is not backed by DX12");
         };
 
-        let hal_device_raw = hal_device.raw_device().as_raw();
-        if hal_device_raw != d3d12_device_raw {
+        let hal_device_raw = Interface::as_raw(hal_device.raw_device());
+        let expected_device_raw = Interface::as_raw(d3d12_device);
+        if hal_device_raw != expected_device_raw {
             anyhow::bail!(
                 "external compositor DX12 device identity mismatch: wgpu={hal_device_raw:p}, \
-                 expected={d3d12_device_raw:p}"
+                 expected={expected_device_raw:p}"
             );
         }
 
-        let hal_queue_raw = hal_device.raw_queue().as_raw();
-        if hal_queue_raw != d3d12_queue_raw {
+        let hal_queue_raw = Interface::as_raw(hal_device.raw_queue());
+        let expected_queue_raw = Interface::as_raw(d3d12_queue);
+        if hal_queue_raw != expected_queue_raw {
             anyhow::bail!(
                 "external compositor DX12 queue identity mismatch: wgpu={hal_queue_raw:p}, \
-                 expected={d3d12_queue_raw:p}"
+                 expected={expected_queue_raw:p}"
             );
         }
 
@@ -280,14 +299,18 @@ mod windows_dx12 {
         Ok(())
     }
 
-    pub(super) unsafe fn texture_resource_raw(
-        texture_view: &wgpu::TextureView,
-    ) -> anyhow::Result<*mut c_void> {
-        let Some(hal_texture) =
-            (unsafe { texture_view.texture().as_hal::<wgpu::hal::api::Dx12>() })
-        else {
+    pub(super) unsafe fn texture_resource(
+        view: Arc<wgpu::TextureView>,
+    ) -> anyhow::Result<Dx12ExternalTextureResource> {
+        let Some(hal_texture) = (unsafe { view.texture().as_hal::<wgpu::hal::api::Dx12>() }) else {
             anyhow::bail!("external compositor returned a non-DX12 wgpu texture on Windows");
         };
-        Ok(unsafe { hal_texture.raw_resource().as_raw() })
+        let resource = unsafe { hal_texture.raw_resource().clone() };
+        let resource_raw = Interface::as_raw(&resource);
+        Ok(Dx12ExternalTextureResource {
+            view,
+            resource,
+            resource_identity: resource_raw as usize,
+        })
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     sync::atomic::{AtomicBool, Ordering},
     thread::{ThreadId, current},
     time::Duration,
@@ -51,10 +52,13 @@ impl WindowsDispatcher {
 
     fn dispatch_on_threadpool(&self, priority: WorkItemPriority, runnable: RunnableVariant) {
         let handler = {
-            let mut task_wrapper = Some(runnable);
+            let task_wrapper = RefCell::new(Some(runnable));
             WorkItemHandler::new(move |_| {
-                let runnable = task_wrapper.take().unwrap();
-                Self::execute_runnable(runnable);
+                if let Some(runnable) = task_wrapper.borrow_mut().take() {
+                    Self::execute_runnable(runnable);
+                } else {
+                    log::error!("thread pool work item was invoked more than once");
+                }
                 Ok(())
             })
         };
@@ -64,10 +68,13 @@ impl WindowsDispatcher {
 
     fn dispatch_on_threadpool_after(&self, runnable: RunnableVariant, duration: Duration) {
         let handler = {
-            let mut task_wrapper = Some(runnable);
+            let task_wrapper = RefCell::new(Some(runnable));
             TimerElapsedHandler::new(move |_| {
-                let runnable = task_wrapper.take().unwrap();
-                Self::execute_runnable(runnable);
+                if let Some(runnable) = task_wrapper.borrow_mut().take() {
+                    Self::execute_runnable(runnable);
+                } else {
+                    log::error!("thread pool timer was invoked more than once");
+                }
                 Ok(())
             })
         };

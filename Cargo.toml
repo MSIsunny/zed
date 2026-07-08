@@ -847,7 +847,7 @@ wasm-bindgen = "0.2.120"
 web-time = "1.1.0"
 webrtc-sys = "0.3.23"
 wgpu = "29.0.4"
-windows-core = "0.61"
+windows-core = "0.62"
 yaml-rust2 = "0.8"
 yawc = "0.2.5"
 zeroize = "1.8"
@@ -855,7 +855,7 @@ zstd = "0.11"
 
 
 [workspace.dependencies.windows]
-version = "0.61"
+version = "0.62"
 features = [
     "Foundation_Numerics",
     "Globalization_DateTimeFormatting",

@@ -952,7 +952,7 @@ dependencies = [
  "smol",
  "tempfile",
  "util",
- "windows 0.61.3",
+ "windows 0.62.2",
  "zeroize",
 ]
 
@@ -1433,7 +1433,7 @@ dependencies = [
  "scopeguard",
  "simplelog",
  "tempfile",
- "windows 0.61.3",
+ "windows 0.62.2",
  "windows_resources",
 ]
 
@@ -3171,7 +3171,7 @@ dependencies = [
  "tempfile",
  "util",
  "walkdir",
- "windows 0.61.3",
+ "windows 0.62.2",
  "windows_resources",
 ]
 
@@ -3228,7 +3228,7 @@ dependencies = [
  "tokio-socks",
  "url",
  "util",
- "windows 0.61.3",
+ "windows 0.62.2",
  "worktree",
  "zed_credentials_provider",
 ]
@@ -4352,7 +4352,7 @@ dependencies = [
  "serde",
  "serde_json",
  "system_specs",
- "windows 0.61.3",
+ "windows 0.62.2",
  "zstd",
 ]
 
@@ -6151,8 +6151,8 @@ dependencies = [
  "serde",
  "serde_json",
  "util",
- "windows 0.61.3",
- "windows-core 0.61.2",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "workspace",
  "wprcontrol",
 ]
@@ -6260,8 +6260,8 @@ dependencies = [
 name = "explorer_command_injector"
 version = "0.1.0"
 dependencies = [
- "windows 0.61.3",
- "windows-core 0.61.2",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "windows-registry 0.5.3",
 ]
 
@@ -6895,7 +6895,7 @@ dependencies = [
  "trash",
  "unicode-normalization",
  "util",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -7424,7 +7424,7 @@ dependencies = [
  "unindent",
  "util",
  "watch",
- "windows 0.61.3",
+ "windows 0.62.2",
  "workspace",
  "zed_actions",
  "zeroize",
@@ -7829,7 +7829,7 @@ dependencies = [
  "waker-fn",
  "wasm-bindgen",
  "web-time",
- "windows 0.61.3",
+ "windows 0.62.2",
  "zed-font-kit",
  "zed-scap",
 ]
@@ -8032,8 +8032,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "wgpu",
- "windows 0.61.3",
- "windows-core 0.62.2",
+ "windows 0.62.2",
  "zed-font-kit",
 ]
 
@@ -8059,9 +8058,9 @@ dependencies = [
  "raw-window-handle",
  "smallvec",
  "uuid",
- "windows 0.61.3",
- "windows-core 0.61.2",
- "windows-numerics 0.2.0",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "windows-numerics 0.3.1",
  "windows-registry 0.5.3",
  "zed-scap",
 ]
@@ -11436,7 +11435,7 @@ dependencies = [
  "async-io",
  "smol",
  "tempfile",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -13616,7 +13615,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
- "windows 0.61.3",
+ "windows 0.62.2",
  "workspace",
  "zed_actions",
 ]
@@ -15228,7 +15227,7 @@ dependencies = [
  "util",
  "uuid",
  "watch",
- "windows 0.61.3",
+ "windows 0.62.2",
  "workspace",
  "worktree",
  "zlog",
@@ -18403,7 +18402,7 @@ dependencies = [
  "util",
  "util_macros",
  "vte",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -18677,7 +18676,7 @@ dependencies = [
  "core-foundation-sys",
  "sys-locale",
  "time",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -18799,7 +18798,7 @@ dependencies = [
  "theme",
  "ui",
  "util",
- "windows 0.61.3",
+ "windows 0.62.2",
  "workspace",
  "zed_actions",
 ]
@@ -19679,7 +19678,7 @@ dependencies = [
  "strum 0.27.2",
  "theme",
  "ui_macros",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -19949,7 +19948,7 @@ dependencies = [
  "util_macros",
  "walkdir",
  "which 6.0.3",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -22558,7 +22557,7 @@ dependencies = [
  "url",
  "util",
  "uuid",
- "windows 0.61.3",
+ "windows 0.62.2",
  "zed_actions",
  "zlog",
 ]
@@ -23161,7 +23160,7 @@ dependencies = [
  "web_search",
  "web_search_providers",
  "which_key",
- "windows 0.61.3",
+ "windows 0.62.2",
  "windows_resources",
  "workspace",
  "zed-reqwest",

@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use gpui_wgpu::{
-    ExternalComposeOutput, ExternalWgpuContext, WgpuCompositorBackendCtx, WgpuExternalCompositor,
-    dx12_texture_resource_raw, wgpu,
+    Dx12ExternalTextureResource, ExternalComposeOutput, ExternalWgpuContext,
+    WgpuCompositorBackendCtx, WgpuExternalCompositor, wgpu,
 };
 use windows::{
     Win32::{
@@ -25,7 +25,7 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::{IUnknown, Interface},
+    core::Interface,
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
@@ -33,6 +33,9 @@ use crate::*;
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
+const EXTERNAL_COMPOSITOR_D3D12_RESOURCE_STATE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
+);
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
@@ -65,7 +68,8 @@ pub(crate) struct DirectXRenderer {
     wgpu_external_context_generation: u64,
     frame_index: u64,
     external_fence_value: u64,
-    pending_external_frames: VecDeque<(u64, Vec<WindowsComposeOutcome>)>,
+    wrapped_external_textures: HashMap<ExternalSlotHandle, WrappedExternalTexture>,
+    pending_external_frames: VecDeque<RetainedExternalFrameResources>,
 }
 
 /// Direct3D objects
@@ -121,15 +125,62 @@ struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
-#[derive(Clone)]
 enum WindowsComposeOutcome {
     Ready {
-        _view: Arc<wgpu::TextureView>,
-        resource: ID3D11Resource,
-        shader_resource_view: Option<ID3D11ShaderResourceView>,
+        texture: WrappedExternalTexture,
         alpha_premultiplied: bool,
     },
     Skipped,
+}
+
+#[derive(Clone)]
+struct WrappedExternalTexture {
+    _source: Dx12ExternalTextureResource,
+    resource: ID3D11Resource,
+    shader_resource_view: Option<ID3D11ShaderResourceView>,
+    cache_key: WrappedExternalTextureCacheKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WrappedExternalTextureCacheKey {
+    resource_identity: usize,
+    context_generation: u64,
+    format: ExternalSlotFormat,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+}
+
+struct RetainedExternalFrameResources {
+    fence_value: u64,
+    textures: Vec<WrappedExternalTexture>,
+}
+
+impl RetainedExternalFrameResources {
+    fn len(&self) -> usize {
+        self.textures.len()
+    }
+
+    fn is_completed(&self, completed_fence_value: u64) -> bool {
+        self.fence_value <= completed_fence_value
+    }
+}
+
+impl WrappedExternalTextureCacheKey {
+    fn new(source: &Dx12ExternalTextureResource, descriptor: &ExternalSlotDescriptor) -> Self {
+        Self::from_parts(source.resource_identity(), descriptor)
+    }
+
+    fn from_parts(resource_identity: usize, descriptor: &ExternalSlotDescriptor) -> Self {
+        Self {
+            resource_identity,
+            context_generation: descriptor.context_generation,
+            format: descriptor.format,
+            width: descriptor.width,
+            height: descriptor.height,
+            sample_count: descriptor.sample_count,
+        }
+    }
 }
 
 impl DirectXRendererDevices {
@@ -219,6 +270,7 @@ impl DirectXRenderer {
             wgpu_external_context_generation: 1,
             frame_index: 0,
             external_fence_value: 0,
+            wrapped_external_textures: HashMap::new(),
             pending_external_frames: VecDeque::new(),
         })
     }
@@ -346,6 +398,7 @@ impl DirectXRenderer {
         self.wgpu_external_context_generation =
             self.wgpu_external_context_generation.saturating_add(1);
         self.external_fence_value = 0;
+        self.wrapped_external_textures.clear();
         self.pending_external_frames.clear();
         self.skip_draws = true;
         Ok(())
@@ -845,18 +898,18 @@ impl DirectXRenderer {
         for (handle, output) in raw_outcomes {
             let outcome = match output {
                 ExternalComposeOutput::Ready { view } => {
+                    let Some(slot_descriptor) = registry.borrow().descriptor(handle).cloned()
+                    else {
+                        outcomes.insert(handle, WindowsComposeOutcome::Skipped);
+                        continue;
+                    };
                     let alpha_premultiplied =
-                        registry
-                            .borrow()
-                            .descriptor(handle)
-                            .is_some_and(|descriptor| {
-                                descriptor.alpha_mode == AlphaMode::PreMultiplied
-                            });
-                    match self.wrap_external_texture_view(Arc::clone(&view)) {
-                        Ok((resource, shader_resource_view)) => WindowsComposeOutcome::Ready {
-                            _view: view,
-                            resource,
-                            shader_resource_view,
+                        slot_descriptor.alpha_mode == AlphaMode::PreMultiplied;
+                    match Dx12ExternalTextureResource::new(Arc::clone(&view)).and_then(|source| {
+                        self.cached_wrapped_external_texture(handle, source, &slot_descriptor)
+                    }) {
+                        Ok(texture) => WindowsComposeOutcome::Ready {
+                            texture,
                             alpha_premultiplied,
                         },
                         Err(error) => {
@@ -875,6 +928,8 @@ impl DirectXRenderer {
             };
             outcomes.insert(handle, outcome);
         }
+        self.wrapped_external_textures
+            .retain(|handle, _| outcomes.contains_key(handle));
         outcomes
     }
 
@@ -920,16 +975,31 @@ impl DirectXRenderer {
         (output, true)
     }
 
-    fn wrap_external_texture_view(
-        &self,
-        view: Arc<wgpu::TextureView>,
-    ) -> Result<(ID3D11Resource, Option<ID3D11ShaderResourceView>)> {
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let d3d12_resource_raw = unsafe { dx12_texture_resource_raw(&view) }?;
-        let d3d12_resource = unsafe { IUnknown::from_raw_borrowed(&d3d12_resource_raw) }
-            .context("Borrowing external compositor D3D12 texture resource")?
-            .clone();
+    fn cached_wrapped_external_texture(
+        &mut self,
+        handle: ExternalSlotHandle,
+        source: Dx12ExternalTextureResource,
+        descriptor: &ExternalSlotDescriptor,
+    ) -> Result<WrappedExternalTexture> {
+        let cache_key = WrappedExternalTextureCacheKey::new(&source, descriptor);
+        if let Some(cached) = self.wrapped_external_textures.get(&handle)
+            && cached.cache_key == cache_key
+        {
+            return Ok(cached.clone());
+        }
 
+        let texture = self.create_wrapped_external_texture(source, cache_key)?;
+        self.wrapped_external_textures
+            .insert(handle, texture.clone());
+        Ok(texture)
+    }
+
+    fn create_wrapped_external_texture(
+        &self,
+        source: Dx12ExternalTextureResource,
+        cache_key: WrappedExternalTextureCacheKey,
+    ) -> Result<WrappedExternalTexture> {
+        let devices = self.devices.as_ref().context("devices missing")?;
         let flags = D3D11_RESOURCE_FLAGS {
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             MiscFlags: 0,
@@ -939,10 +1009,10 @@ impl DirectXRenderer {
         let mut resource: Option<ID3D11Resource> = None;
         unsafe {
             devices.d3d11on12_device.CreateWrappedResource(
-                &d3d12_resource,
+                source.resource(),
                 &flags,
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                EXTERNAL_COMPOSITOR_D3D12_RESOURCE_STATE,
+                EXTERNAL_COMPOSITOR_D3D12_RESOURCE_STATE,
                 &mut resource,
             )?;
         }
@@ -956,7 +1026,12 @@ impl DirectXRenderer {
                 Some(&mut shader_resource_view),
             )?;
         }
-        Ok((resource, shader_resource_view))
+        Ok(WrappedExternalTexture {
+            _source: source,
+            resource,
+            shader_resource_view,
+            cache_key,
+        })
     }
 
     fn invalidate_external_wgpu_context(
@@ -966,6 +1041,7 @@ impl DirectXRenderer {
         self.wgpu_external_context_generation =
             self.wgpu_external_context_generation.saturating_add(1);
         let new_generation = self.wgpu_external_context_generation;
+        self.wrapped_external_textures.clear();
         let handles = {
             let mut registry = registry.borrow_mut();
             registry.on_context_recreated(new_generation);
@@ -994,8 +1070,7 @@ impl DirectXRenderer {
         let resources = self.resources.as_ref().context("resources missing")?;
         for primitive in external_compositors {
             let Some(WindowsComposeOutcome::Ready {
-                resource,
-                shader_resource_view,
+                texture,
                 alpha_premultiplied,
                 ..
             }) = outcomes.get(&primitive.handle)
@@ -1013,7 +1088,7 @@ impl DirectXRenderer {
                 &devices.device_context,
                 slice::from_ref(&sprite),
             )?;
-            let wrapped_resources = [Some(resource.clone())];
+            let wrapped_resources = [Some(texture.resource.clone())];
             unsafe {
                 devices
                     .d3d11on12_device
@@ -1023,7 +1098,7 @@ impl DirectXRenderer {
                 .external_compositor_pipeline
                 .draw_with_texture(
                     &devices.device_context,
-                    slice::from_ref(shader_resource_view),
+                    slice::from_ref(&texture.shader_resource_view),
                     slice::from_ref(&resources.viewport),
                     slice::from_ref(&self.globals.global_params_buffer),
                     slice::from_ref(&self.globals.sampler),
@@ -1045,7 +1120,7 @@ impl DirectXRenderer {
         let retained = outcomes
             .values()
             .filter_map(|outcome| match outcome {
-                WindowsComposeOutcome::Ready { .. } => Some(outcome.clone()),
+                WindowsComposeOutcome::Ready { texture, .. } => Some(texture.clone()),
                 WindowsComposeOutcome::Skipped => None,
             })
             .collect::<Vec<_>>();
@@ -1062,7 +1137,10 @@ impl DirectXRenderer {
                 .context("Signaling external compositor fence")?;
         }
         self.pending_external_frames
-            .push_back((self.external_fence_value, retained));
+            .push_back(RetainedExternalFrameResources {
+                fence_value: self.external_fence_value,
+                textures: retained,
+            });
         self.release_completed_external_frames();
         Ok(())
     }
@@ -1076,9 +1154,15 @@ impl DirectXRenderer {
         while self
             .pending_external_frames
             .front()
-            .is_some_and(|(fence_value, _)| *fence_value <= completed)
+            .is_some_and(|resources| resources.is_completed(completed))
         {
-            self.pending_external_frames.pop_front();
+            if let Some(resources) = self.pending_external_frames.pop_front() {
+                log::trace!(
+                    "released {} retained external compositor texture(s) at fence {}",
+                    resources.len(),
+                    resources.fence_value
+                );
+            }
         }
     }
 
@@ -1576,6 +1660,88 @@ struct ExternalCompositorSprite {
     content_mask: ContentMask<ScaledPixels>,
     alpha_premultiplied: u32,
     _pad: [u32; 3],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EXTERNAL_COMPOSITOR_D3D12_RESOURCE_STATE, RetainedExternalFrameResources,
+        WrappedExternalTextureCacheKey,
+    };
+    use gpui::{AlphaMode, ExternalSlotDescriptor, ExternalSlotFormat};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    };
+
+    fn descriptor(
+        context_generation: u64,
+        format: ExternalSlotFormat,
+        width: u32,
+        height: u32,
+    ) -> ExternalSlotDescriptor {
+        ExternalSlotDescriptor {
+            format,
+            alpha_mode: AlphaMode::PreMultiplied,
+            width,
+            height,
+            sample_count: 1,
+            context_generation,
+        }
+    }
+
+    #[test]
+    fn external_compositor_resource_state_matches_wgpu_resource_use() {
+        let expected = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        assert_eq!(EXTERNAL_COMPOSITOR_D3D12_RESOURCE_STATE, expected);
+    }
+
+    #[test]
+    fn wrapped_external_texture_cache_key_tracks_resource_and_descriptor_shape() {
+        let base = descriptor(1, ExternalSlotFormat::Bgra8UnormSrgb, 320, 240);
+        let key = WrappedExternalTextureCacheKey::from_parts(0x1000, &base);
+        assert_eq!(
+            key,
+            WrappedExternalTextureCacheKey::from_parts(0x1000, &base)
+        );
+
+        assert_ne!(
+            key,
+            WrappedExternalTextureCacheKey::from_parts(0x2000, &base)
+        );
+
+        let mut resized = base.clone();
+        resized.width = 640;
+        assert_ne!(
+            key,
+            WrappedExternalTextureCacheKey::from_parts(0x1000, &resized)
+        );
+
+        let mut new_generation = base.clone();
+        new_generation.context_generation = 2;
+        assert_ne!(
+            key,
+            WrappedExternalTextureCacheKey::from_parts(0x1000, &new_generation)
+        );
+
+        let mut new_format = base;
+        new_format.format = ExternalSlotFormat::Rgba16Float;
+        assert_ne!(
+            key,
+            WrappedExternalTextureCacheKey::from_parts(0x1000, &new_format)
+        );
+    }
+
+    #[test]
+    fn retained_external_frame_resources_release_after_fence_completion() {
+        let resources = RetainedExternalFrameResources {
+            fence_value: 10,
+            textures: Vec::new(),
+        };
+        assert!(!resources.is_completed(9));
+        assert!(resources.is_completed(10));
+        assert!(resources.is_completed(11));
+    }
 }
 
 impl Drop for DirectXRenderer {
