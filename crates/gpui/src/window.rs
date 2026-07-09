@@ -2437,8 +2437,7 @@ impl Window {
 
     /// This window's external compositor registry, if the platform backend supports
     /// external composition (see [`ExternalCompositorRegistry`]). Returns `None` on
-    /// backends without support (e.g. headless/test windows, or macOS/Metal in this
-    /// phase).
+    /// backends without support (e.g. headless/test windows).
     pub fn external_compositor_registry(&self) -> Option<Rc<RefCell<ExternalCompositorRegistry>>> {
         self.platform_window.external_compositor_registry()
     }

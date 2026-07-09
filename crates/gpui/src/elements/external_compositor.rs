@@ -13,8 +13,8 @@ use refineable::Refineable;
 ///
 /// Defaults to the slot's native resolution (converted from device texels to
 /// logical pixels via the window's scale factor) unless an explicit `w`/`h` is set
-/// via [`Styled`]; if there is no registry (e.g. macOS/Metal in this phase) or the
-/// handle isn't registered, defaults to zero size instead of guessing.
+/// via [`Styled`]; if there is no registry or the handle isn't registered, defaults
+/// to zero size instead of guessing.
 pub struct ExternalCompositorElement {
     handle: ExternalSlotHandle,
     background: Option<Background>,
@@ -66,9 +66,8 @@ impl Element for ExternalCompositorElement {
         // Default to the slot's native resolution, the same way `Img` defaults to
         // an image's natural size (see `elements/img.rs`): only when the caller
         // hasn't set an explicit `w`/`h` (`Length::Auto`), so an explicit style
-        // always wins. With no registry (e.g. macOS/Metal in this phase) or an
-        // unregistered handle, there's no size to infer, so default to zero rather
-        // than guess.
+        // always wins. With no registry or an unregistered handle, there's no size
+        // to infer, so default to zero rather than guess.
         let slot_size = window
             .external_compositor_registry()
             .and_then(|registry| registry.borrow().slot_size(self.handle))
@@ -109,9 +108,9 @@ impl Element for ExternalCompositorElement {
         _: &mut App,
     ) {
         // Paint the background first, at the same bounds, before the external
-        // compositor primitive: this gives backends without composition support
-        // (e.g. macOS/Metal in this phase), or a slot with no frame ready yet,
-        // something to show instead of a transparent hole. Backends that do
+        // compositor primitive: this gives backends without composition support,
+        // or a slot with no frame ready yet, something to show instead of a
+        // transparent hole. Backends that do
         // composite this frame draw over it (the render pass uses `Load`, not
         // `Clear`, for this primitive), so translucent content painted above this
         // element still shows the background through, by design (see

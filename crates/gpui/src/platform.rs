@@ -667,9 +667,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     /// Returns this window's [`ExternalCompositorRegistry`](crate::ExternalCompositorRegistry),
     /// if the backend supports external composition. The default implementation
-    /// returns `None`, which is appropriate for backends that don't support it (e.g.
-    /// headless/test windows, or platforms without a renderer that implements the
-    /// `ExternalCompositors` scene batch, such as macOS/Metal in this phase).
+    /// returns `None`, which is appropriate for backends that don't support it, such
+    /// as headless/test windows or platforms without a renderer that implements the
+    /// `ExternalCompositors` scene batch.
     fn external_compositor_registry(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::ExternalCompositorRegistry>>> {

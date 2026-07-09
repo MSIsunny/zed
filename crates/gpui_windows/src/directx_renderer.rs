@@ -1,6 +1,9 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    error::Error,
+    fmt,
+    hash::{Hash, Hasher},
     rc::Rc,
     slice,
     sync::{Arc, OnceLock, atomic::Ordering},
@@ -68,7 +71,7 @@ pub(crate) struct DirectXRenderer {
     wgpu_external_context_generation: u64,
     frame_index: u64,
     external_fence_value: u64,
-    wrapped_external_textures: HashMap<ExternalSlotHandle, WrappedExternalTexture>,
+    wrapped_external_textures: HashMap<WrappedExternalTextureCacheKey, WrappedExternalTexture>,
     pending_external_frames: VecDeque<RetainedExternalFrameResources>,
 }
 
@@ -138,11 +141,11 @@ struct WrappedExternalTexture {
     _source: Dx12ExternalTextureResource,
     resource: ID3D11Resource,
     shader_resource_view: Option<ID3D11ShaderResourceView>,
-    cache_key: WrappedExternalTextureCacheKey,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WrappedExternalTextureCacheKey {
+    slot: ExternalSlotHandle,
     resource_identity: usize,
     context_generation: u64,
     format: ExternalSlotFormat,
@@ -151,9 +154,26 @@ struct WrappedExternalTextureCacheKey {
     sample_count: u32,
 }
 
+impl Hash for WrappedExternalTextureCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.slot.hash(state);
+        self.resource_identity.hash(state);
+        self.context_generation.hash(state);
+        std::mem::discriminant(&self.format).hash(state);
+        self.width.hash(state);
+        self.height.hash(state);
+        self.sample_count.hash(state);
+    }
+}
+
 struct RetainedExternalFrameResources {
     fence_value: u64,
     textures: Vec<WrappedExternalTexture>,
+}
+
+struct WrappedResourceAccess<'a> {
+    device: &'a ID3D11On12Device,
+    resources: [Option<ID3D11Resource>; 1],
 }
 
 impl RetainedExternalFrameResources {
@@ -166,13 +186,40 @@ impl RetainedExternalFrameResources {
     }
 }
 
+impl<'a> WrappedResourceAccess<'a> {
+    fn new(device: &'a ID3D11On12Device, resource: ID3D11Resource) -> Self {
+        let resources = [Some(resource)];
+        unsafe {
+            device.AcquireWrappedResources(&resources);
+        }
+        Self { device, resources }
+    }
+}
+
+impl Drop for WrappedResourceAccess<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.ReleaseWrappedResources(&self.resources);
+        }
+    }
+}
+
 impl WrappedExternalTextureCacheKey {
-    fn new(source: &Dx12ExternalTextureResource, descriptor: &ExternalSlotDescriptor) -> Self {
-        Self::from_parts(source.resource_identity(), descriptor)
+    fn new(
+        slot: ExternalSlotHandle,
+        source: &Dx12ExternalTextureResource,
+        descriptor: &ExternalSlotDescriptor,
+    ) -> Self {
+        Self::from_parts(slot, source.resource_identity(), descriptor)
     }
 
-    fn from_parts(resource_identity: usize, descriptor: &ExternalSlotDescriptor) -> Self {
+    fn from_parts(
+        slot: ExternalSlotHandle,
+        resource_identity: usize,
+        descriptor: &ExternalSlotDescriptor,
+    ) -> Self {
         Self {
+            slot,
             resource_identity,
             context_generation: descriptor.context_generation,
             format: descriptor.format,
@@ -182,6 +229,17 @@ impl WrappedExternalTextureCacheKey {
         }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct ExternalWgpuDeviceLost;
+
+impl fmt::Display for ExternalWgpuDeviceLost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Windows external wgpu device was lost")
+    }
+}
+
+impl Error for ExternalWgpuDeviceLost {}
 
 impl DirectXRendererDevices {
     pub(crate) fn new(
@@ -418,7 +476,7 @@ impl DirectXRenderer {
         self.frame_index = self.frame_index.wrapping_add(1);
         self.release_completed_external_frames();
         let external_outcomes =
-            self.compose_external_compositors(scene, external_compositors.as_ref());
+            self.compose_external_compositors(scene, external_compositors.as_ref())?;
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -828,29 +886,29 @@ impl DirectXRenderer {
         &mut self,
         scene: &Scene,
         registry: Option<&Rc<RefCell<ExternalCompositorRegistry>>>,
-    ) -> HashMap<ExternalSlotHandle, WindowsComposeOutcome> {
+    ) -> Result<HashMap<ExternalSlotHandle, WindowsComposeOutcome>> {
         let Some(registry) = registry else {
-            return HashMap::default();
+            return Ok(HashMap::default());
         };
         if scene.external_compositors.is_empty() {
-            return HashMap::default();
+            self.prune_wrapped_external_texture_cache(registry, None);
+            return Ok(HashMap::default());
         }
 
         let Some(devices) = self.devices.as_ref() else {
-            return HashMap::default();
+            return Ok(HashMap::default());
         };
         if devices
             .external_wgpu_context
             .device_lost
             .load(Ordering::Relaxed)
         {
-            log::warn!("Windows external wgpu device was lost; invalidating external compositors");
-            self.invalidate_external_wgpu_context(registry);
-            return HashMap::default();
+            return Err(ExternalWgpuDeviceLost.into());
         }
 
         let device = Arc::clone(&devices.external_wgpu_context.device);
         let queue = Arc::clone(&devices.external_wgpu_context.queue);
+        let external_device_lost = Arc::clone(&devices.external_wgpu_context.device_lost);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("windows_external_compositor_encoder"),
         });
@@ -870,6 +928,10 @@ impl DirectXRenderer {
                 &mut encoder,
             );
             composed_any |= did_compose;
+            if matches!(outcome, ExternalComposeOutput::ContextLost) {
+                external_device_lost.store(true, Ordering::Relaxed);
+                return Err(ExternalWgpuDeviceLost.into());
+            }
             raw_outcomes.insert(handle, outcome);
         }
 
@@ -922,15 +984,14 @@ impl DirectXRenderer {
                 }
                 ExternalComposeOutput::NotReady => WindowsComposeOutcome::Skipped,
                 ExternalComposeOutput::ContextLost => {
-                    self.invalidate_external_wgpu_context(registry);
-                    WindowsComposeOutcome::Skipped
+                    external_device_lost.store(true, Ordering::Relaxed);
+                    return Err(ExternalWgpuDeviceLost.into());
                 }
             };
             outcomes.insert(handle, outcome);
         }
-        self.wrapped_external_textures
-            .retain(|handle, _| outcomes.contains_key(handle));
-        outcomes
+        self.prune_wrapped_external_texture_cache(registry, Some(&outcomes));
+        Ok(outcomes)
     }
 
     fn compose_one_external_compositor(
@@ -981,23 +1042,20 @@ impl DirectXRenderer {
         source: Dx12ExternalTextureResource,
         descriptor: &ExternalSlotDescriptor,
     ) -> Result<WrappedExternalTexture> {
-        let cache_key = WrappedExternalTextureCacheKey::new(&source, descriptor);
-        if let Some(cached) = self.wrapped_external_textures.get(&handle)
-            && cached.cache_key == cache_key
-        {
+        let cache_key = WrappedExternalTextureCacheKey::new(handle, &source, descriptor);
+        if let Some(cached) = self.wrapped_external_textures.get(&cache_key) {
             return Ok(cached.clone());
         }
 
-        let texture = self.create_wrapped_external_texture(source, cache_key)?;
+        let texture = self.create_wrapped_external_texture(source)?;
         self.wrapped_external_textures
-            .insert(handle, texture.clone());
+            .insert(cache_key, texture.clone());
         Ok(texture)
     }
 
     fn create_wrapped_external_texture(
         &self,
         source: Dx12ExternalTextureResource,
-        cache_key: WrappedExternalTextureCacheKey,
     ) -> Result<WrappedExternalTexture> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let flags = D3D11_RESOURCE_FLAGS {
@@ -1030,32 +1088,21 @@ impl DirectXRenderer {
             _source: source,
             resource,
             shader_resource_view,
-            cache_key,
         })
     }
 
-    fn invalidate_external_wgpu_context(
+    fn prune_wrapped_external_texture_cache(
         &mut self,
         registry: &Rc<RefCell<ExternalCompositorRegistry>>,
+        outcomes: Option<&HashMap<ExternalSlotHandle, WindowsComposeOutcome>>,
     ) {
-        self.wgpu_external_context_generation =
-            self.wgpu_external_context_generation.saturating_add(1);
-        let new_generation = self.wgpu_external_context_generation;
-        self.wrapped_external_textures.clear();
-        let handles = {
-            let mut registry = registry.borrow_mut();
-            registry.on_context_recreated(new_generation);
-            registry.occupied_handles().collect::<Vec<_>>()
-        };
-        for handle in handles {
-            let Some(mut boxed) = registry.borrow_mut().take_compositor(handle) else {
-                continue;
-            };
-            if let Some(compositor) = boxed.downcast_mut::<Box<dyn WgpuExternalCompositor>>() {
-                compositor.on_context_recreated(new_generation);
-            }
-            registry.borrow_mut().put_back_compositor(handle, boxed);
-        }
+        let current_generation = self.wgpu_external_context_generation;
+        let occupied_handles = registry.borrow().occupied_handles().collect::<HashSet<_>>();
+        self.wrapped_external_textures.retain(|cache_key, _| {
+            cache_key.context_generation == current_generation
+                && occupied_handles.contains(&cache_key.slot)
+                && outcomes.is_none_or(|outcomes| outcomes.contains_key(&cache_key.slot))
+        });
     }
 
     fn draw_external_compositors(
@@ -1088,12 +1135,8 @@ impl DirectXRenderer {
                 &devices.device_context,
                 slice::from_ref(&sprite),
             )?;
-            let wrapped_resources = [Some(texture.resource.clone())];
-            unsafe {
-                devices
-                    .d3d11on12_device
-                    .AcquireWrappedResources(&wrapped_resources);
-            }
+            let _wrapped_resource_access =
+                WrappedResourceAccess::new(&devices.d3d11on12_device, texture.resource.clone());
             self.pipelines
                 .external_compositor_pipeline
                 .draw_with_texture(
@@ -1104,11 +1147,6 @@ impl DirectXRenderer {
                     slice::from_ref(&self.globals.sampler),
                     1,
                 )?;
-            unsafe {
-                devices
-                    .d3d11on12_device
-                    .ReleaseWrappedResources(&wrapped_resources);
-            }
         }
         Ok(())
     }
@@ -1668,7 +1706,7 @@ mod tests {
         EXTERNAL_COMPOSITOR_D3D12_RESOURCE_STATE, RetainedExternalFrameResources,
         WrappedExternalTextureCacheKey,
     };
-    use gpui::{AlphaMode, ExternalSlotDescriptor, ExternalSlotFormat};
+    use gpui::{AlphaMode, ExternalCompositorRegistry, ExternalSlotDescriptor, ExternalSlotFormat};
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
     };
@@ -1699,36 +1737,48 @@ mod tests {
     #[test]
     fn wrapped_external_texture_cache_key_tracks_resource_and_descriptor_shape() {
         let base = descriptor(1, ExternalSlotFormat::Bgra8UnormSrgb, 320, 240);
-        let key = WrappedExternalTextureCacheKey::from_parts(0x1000, &base);
+        let mut registry = ExternalCompositorRegistry::new();
+        let slot = registry
+            .register(base.clone(), Box::new(()))
+            .expect("valid external compositor slot");
+        let other_slot = registry
+            .register(base.clone(), Box::new(()))
+            .expect("valid external compositor slot");
+        let key = WrappedExternalTextureCacheKey::from_parts(slot, 0x1000, &base);
         assert_eq!(
             key,
-            WrappedExternalTextureCacheKey::from_parts(0x1000, &base)
+            WrappedExternalTextureCacheKey::from_parts(slot, 0x1000, &base)
         );
 
         assert_ne!(
             key,
-            WrappedExternalTextureCacheKey::from_parts(0x2000, &base)
+            WrappedExternalTextureCacheKey::from_parts(other_slot, 0x1000, &base)
+        );
+
+        assert_ne!(
+            key,
+            WrappedExternalTextureCacheKey::from_parts(slot, 0x2000, &base)
         );
 
         let mut resized = base.clone();
         resized.width = 640;
         assert_ne!(
             key,
-            WrappedExternalTextureCacheKey::from_parts(0x1000, &resized)
+            WrappedExternalTextureCacheKey::from_parts(slot, 0x1000, &resized)
         );
 
         let mut new_generation = base.clone();
         new_generation.context_generation = 2;
         assert_ne!(
             key,
-            WrappedExternalTextureCacheKey::from_parts(0x1000, &new_generation)
+            WrappedExternalTextureCacheKey::from_parts(slot, 0x1000, &new_generation)
         );
 
         let mut new_format = base;
         new_format.format = ExternalSlotFormat::Rgba16Float;
         assert_ne!(
             key,
-            WrappedExternalTextureCacheKey::from_parts(0x1000, &new_format)
+            WrappedExternalTextureCacheKey::from_parts(slot, 0x1000, &new_format)
         );
     }
 

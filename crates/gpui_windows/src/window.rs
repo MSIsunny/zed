@@ -952,15 +952,21 @@ impl PlatformWindow for WindowsWindow {
 
     fn draw(&self, scene: &Scene) {
         let external_compositors = Rc::clone(&self.state.external_compositors);
-        self.state
-            .renderer
-            .borrow_mut()
-            .draw(
-                scene,
-                self.state.background_appearance.get(),
-                Some(external_compositors),
-            )
-            .log_err();
+        let result = self.state.renderer.borrow_mut().draw(
+            scene,
+            self.state.background_appearance.get(),
+            Some(external_compositors),
+        );
+        if let Err(error) = result {
+            if error.downcast_ref::<ExternalWgpuDeviceLost>().is_some() {
+                log::warn!("{error}; scheduling DirectX device recovery");
+                self.state
+                    .invalidate_devices
+                    .store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                log::error!("{error:?}");
+            }
+        }
     }
 
     fn external_compositor_registry(&self) -> Option<Rc<RefCell<ExternalCompositorRegistry>>> {

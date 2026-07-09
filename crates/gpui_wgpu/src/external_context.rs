@@ -49,17 +49,6 @@ impl ExternalWgpuContext {
     pub unsafe fn from_metal_device(metal_device: *mut std::ffi::c_void) -> anyhow::Result<Self> {
         unsafe { macos::from_metal_device(metal_device) }
     }
-
-    #[cfg(target_os = "windows")]
-    /// # Safety
-    ///
-    /// `_d3d12_device` must be a valid, live `ID3D12Device` pointer once this
-    /// constructor is implemented.
-    pub unsafe fn from_d3d12_device(_d3d12_device: *mut std::ffi::c_void) -> anyhow::Result<Self> {
-        anyhow::bail!(
-            "creating an external wgpu context from a D3D12 device is not implemented yet"
-        )
-    }
 }
 
 #[cfg(target_os = "windows")]

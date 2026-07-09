@@ -50,18 +50,10 @@ The macOS platform path is implemented:
 - Headless and `render_to_image` paths pass an empty external compositor outcome
   map, so test-support rendering does not depend on a live platform registry.
 
-The Windows platform path is not implemented yet:
-
-- `crates/gpui_windows/src/window.rs` does not store or expose an
-  `ExternalCompositorRegistry`.
-- `crates/gpui_windows/src/directx_renderer.rs` currently skips
-  `PrimitiveBatch::ExternalCompositors`.
-- `crates/gpui_windows` currently uses a D3D11 renderer and does not enable the
-  `windows` crate features for D3D12 or D3D11On12.
-- `crates/gpui_wgpu/src/external_context.rs` has a Windows
-  `from_d3d12_device` placeholder, but the recommended route below does not need
-  to start from an existing D3D12 device. Instead, `wgpu` should create the DX12
-  device and GPUI should derive its D3D11On12 device from that.
+The Windows platform path uses the same backend-neutral registry/compositor API
+as macOS and Linux. On Windows, `wgpu` owns the DX12 device and command queue;
+GPUI derives its D3D11On12 device from those same objects so the external
+texture and GPUI draw work share one GPU timeline.
 
 ## Lessons From macOS
 
@@ -264,13 +256,15 @@ The cache key should include at least:
 
 - Slot handle.
 - Texture identity or underlying resource identity.
+- Context generation.
 - Width/height.
 - Format.
-- Alpha mode if it changes shader behavior.
+- Sample count.
 
-The initial version can be simpler and recreate wrapped resources/SRVs per
-resize or resource change. Avoid rebuilding them every frame once the spike is
-working.
+Cache entries must be invalidated on slot removal, context recreation, resize,
+format changes, sample-count changes, or resource identity changes. Multi-buffered
+compositors may rotate several resources through one slot, so the cache should
+allow more than one entry per slot.
 
 ### 7. Draw External Compositor Batches
 
@@ -335,8 +329,8 @@ Recommended implementation:
 - At the beginning or end of each frame, release entries whose fence has
   completed.
 
-For an early spike, retaining the last few frames is acceptable as a temporary
-debugging simplification. The engineering-grade path should use a fence.
+Returned `Arc<wgpu::TextureView>` values, wrapped resources, and SRVs are kept
+alive until the fence proves the D3D11On12 work that sampled them has completed.
 
 ### 10. Handle Device Loss and Context Recreation
 
